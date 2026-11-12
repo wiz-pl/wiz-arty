@@ -165,3 +165,5 @@ worth an upstream report. A `-nobram` build of the core (512 RAM256X1S) misses 5
   master current and contrasts with GRAM black and the display off, then the current
   raised in four steps 60 ms apart). An external supply (barrel jack) would avoid the
   question; the user has none.
+
+**Update 2026-11-12 13:36:** confirmed as a supply problem. With the Arty on an external barrel-jack supply (JP2 = EXT), the fixed `oled_test` runs and shows the test pattern. The USB device stayed at 5:23, with no re-enumeration; the only kernel messages are openFPGALoader detaching and reattaching ftdi_sio on interface 0 for JTAG. On USB power alone, turning on VCCEN (the ~13 V boost) browns the board out. The soft-start variants (`oled_softvcc`, `oled_gentle`) are written but not built; they'd only be needed for USB-only use.
