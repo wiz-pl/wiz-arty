@@ -18,6 +18,14 @@ reads IDCODE 0x0362D093 (xc7a35t).
 | `echo` (divider 868) | 4096 random bytes back to back, 3 runs | one byte dropped each time, near byte 2223 (see below) |
 | `squares` | 10 bytes; then all 256 values twice | replies exactly as specified: RAMB18E1 and DSP48E1 work |
 | `echo` (divider 866) | 4096 random bytes ×3, then 32768 in one burst | all identical |
+| `sq36`, `rom36` (bisect) | `squares` on a RAMB36E1; a hello read from a RAMB36E1 ROM (INIT) | both as specified |
+| `half_hello` (bisect) | hello behind a free-running half-rate enable, divider 433 | repeated text |
+| wiz-rv `rv32im_arty_uart` | RV32IM core (Verilog from the wiz-rv agent): 4 RAMB36E1, 10 DSP48E1, 12 RAM32M, half rate | banner, `M self-test: PASS`, primes to 997, `> ` prompt that echoes: byte for byte as specified |
+
+**A host-side trap (cost an hour):** `stty … min 0 time 5` makes `cat` give up after
+0.5 s without data, so a capture started before a load ends during the 2-3 s
+configuration and sees nothing. Several "silent" designs (the RISC-V core, the half-rate
+hello) were in fact working. Capture with `min 1 time 0` and a `timeout`.
 
 ## UART clock rates: the board must be fast of the FT2232, not exact
 
@@ -92,6 +100,18 @@ with bounded buffering. The rounded-to-nominal divider is the wrong default for 
 * Utilisation and timing (35T and 100T, yosys `stat`, nextpnr): all four designs pass at
   100 MHz with Fmax 260-420 MHz; `squares` is 1 RAMB18E1 + 1 DSP48E1 + 57 FFs + ~32
   LUTs.
+
+## Timing checks beyond nextpnr's report
+
+nextpnr reports the worst path per clock and takes `set_multicycle_path` only by
+destination cell, so a half-rate design (2-cycle paths everywhere except from the
+enable flip-flop) cannot be checked with one constraint. What worked: constrain the clock
+at the half rate (20 ns), then bound the 1-cycle paths from the enable flip-flop with a
+longest-path search over nextpnr's `--sdf` output (`scripts`-style, in the agent's
+scratch: about 6.5 ns, under 10 ns). nextpnr's SDF attributes some pins of fractured LUT
+pairs (O5/O6 of one site) to the wrong LUT, which shows up as a fake two-LUT loop. That is
+worth an upstream report. A `-nobram` build of the core (512 RAM256X1S) misses 50 MHz
+(48 MHz).
 
 ## Wiz
 
