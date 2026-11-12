@@ -1,0 +1,271 @@
+import Arty.OledArty
+-- `oled_show`: the Arty's slideshow on the PmodOLEDrgb. Six effects, 512 frame-counter
+-- steps each (8 s at 63.6 frames a second), looping: the four colour effects of
+-- `Arty.FxRgb` (plasma, stars, scroller, XOR), the ray-traced ball of `Arty.Sphere`, and
+-- the sphere-traced blobs, with more than the iCEstick had room for:
+--
+--  * the march does both balls in every cycle (two distance units): 30 steps a pixel
+--    instead of 16;
+--  * the normal and the colour are blended between the two balls by the smooth
+--    minimum's weight h (the gradient of the smooth minimum: n ≈ mix(n2, n1, h)), so the
+--    neck has no seam; the products are DSP slices (`Hw.mul`);
+--  * the floor and the balls' shadows of `sphere` are back.
+--
+-- All three tracers run all the time (each on its own schedule); the colour of the
+-- effect on the screen is picked per pixel. The key on the serial port: `1` … `6` keeps
+-- that effect, `0` goes back to the sequence. LEDs LD4 … LD7: the effect number in
+-- binary on LD4 … LD6, LD7 on once the display is.
+
+------------------------------------------------------------------------------------
+-- The blobs' march, both balls a cycle.
+
+structure BMarch2 (r : HwTy → Type) where
+  z : r D12
+  left : r D5
+  hit : r Bit
+  done : r Bit
+  hh : r D5          -- the smooth minimum's weight at the last step, 0 … 16 (16: ball 1)
+  deriving Bundle
+
+structure StageB2 (r : HwTy → Type) where
+  inp : BIn r
+  mr : BMarch2 r
+  deriving Bundle
+
+def StageB2.init : StageB2 HwTy.El :=
+  StageB2.mk (BIn.mk (BitVec.ofNat 12 1020) (BitVec.ofNat 12 1020) (BitVec.ofNat 12 0) (BitVec.ofNat 12 0))
+    (BMarch2.mk (BitVec.ofNat 12 0) (BitVec.ofNat 5 0) (BitVec.ofNat 1 0) (BitVec.ofNat 1 1) (BitVec.ofNat 5 16))
+
+-- 16 h = 8 + (d2 − d1)/8 clamped to 0 … 16 (k = 64 units)
+def sminWeight {r : HwTy → Type} [Hw r] (d1 d2 : r D12) : r D5 :=
+  let e := Hw.sub d2 d1;
+  let up := bnot (slt12 e (Hw.lit 12 64));
+  let down := slt12 e (Hw.lit 12 4032);
+  Hw.mux up (Hw.lit 5 16) (Hw.mux down (Hw.lit 5 0) (Hw.add (Hw.lit 5 8) (Hw.slice 3 5 e)))
+
+def stageB2Step {r : HwTy → Type} [Hw r] (s : StageB2 r) (shift : r Bit) (a : AOut r) (sc : BScene r) : r StageB2.code :=
+  let b := s.inp;
+  let mr := s.mr;
+  let d1 := ballDist b.rho1 sc.z1 mr.z;
+  let d2 := ballDist b.rho2 sc.z2 mr.z;
+  let d := sminK d1 d2;
+  let marching := bnot mr.done;
+  let close := slt12 d (Hw.lit 12 3);
+  let z2 := Hw.add mr.z d;
+  let gone := bor (bnot (Hw.ult z2 (Hw.lit 12 Bl.far))) (eqLit mr.left 1);
+  let nl := fun (dx dy : r D8) => Hw.sub (Hw.sub (Hw.lit 12 0) (x4 dx)) (x4 dy);
+  StageB2.pack (StageB2.mk
+    (BIn.mk (Hw.mux shift (zext 4 a.rho1) b.rho1) (Hw.mux shift (zext 4 a.rho2) b.rho2)
+      (Hw.mux shift (nl a.dx1 a.dy1) b.l1) (Hw.mux shift (nl a.dx2 a.dy2) b.l2))
+    (BMarch2.mk
+      (Hw.mux shift (Hw.lit 12 Bl.z0) (Hw.mux (band marching (bnot close)) z2 mr.z))
+      (Hw.mux shift (Hw.lit 5 30) (Hw.mux marching (dec mr.left) mr.left))
+      (Hw.mux shift lo (Hw.mux (band marching close) hi mr.hit))
+      (Hw.mux shift lo (Hw.mux (band marching (bor close gone)) hi mr.done))
+      (Hw.mux marching (sminWeight d1 d2) mr.hh)))
+
+-- a · w / 16 for a two's complement 12-bit a and w = 0 … 16 (a DSP slice)
+def mulW {r : HwTy → Type} [Hw r] (a : r D12) (w : r D5) : r D12 :=
+  let sa := Hw.cat (Hw.slice 11 1 a) (Hw.cat (Hw.slice 11 1 a) (Hw.cat (Hw.slice 11 1 a) (Hw.cat (Hw.slice 11 1 a) a)));
+  Hw.slice 4 12 (Hw.mul sa (zext 11 w))
+
+-- (c1 · w + c2 · (16 − w)) / 16 for 6-bit colours
+def mix6 {r : HwTy → Type} [Hw r] (c1 c2 : Nat) (w : r D5) : r D6 :=
+  Hw.slice 4 6 (Hw.add (Hw.mul (Hw.lit 10 c1) (zext 5 w)) (Hw.mul (Hw.lit 10 c2) (zext 5 (Hw.sub (Hw.lit 5 16) w))))
+
+-- c · lum / 64
+def shade6 {r : HwTy → Type} [Hw r] (c lum : r D6) : r D6 := Hw.slice 6 6 (Hw.mul (zext 6 c) (zext 6 lum))
+
+-- ball 1 orange, ball 2 cyan (6 bits a channel)
+def blob2Color {r : HwTy → Type} [Hw r] (s : StageB2 r) (sc : BScene r) (x : r D7) (y : r D6) (t : r D9) : r (HwTy.bits 16) :=
+  let b := s.inp;
+  let w := s.mr.hh;
+  -- −nx − ny − 2 nz of each ball, nz from its ρ; blended by the weight
+  let front := fun (rho : r D12) =>
+    zext 6 (Rom.at 6 (Hw.mux (eqLit (Hw.slice 6 6 rho) 0) (Hw.slice 1 5 rho) (Hw.lit 5 31)) Bl.frontT);
+  let l1 := Hw.add b.l1 (Hw.cat (Hw.slice 0 11 (front b.rho1)) lo);
+  let l2 := Hw.add b.l2 (Hw.cat (Hw.slice 0 11 (front b.rho2)) lo);
+  let l := Hw.add l2 (mulW (Hw.sub l1 l2) w);
+  let sg := Hw.slice 11 1 l;
+  let v := Hw.add (Hw.lit 12 20) (Hw.add (Hw.cat sg (Hw.cat sg (Hw.slice 2 10 l))) (Hw.cat sg (Hw.cat sg (Hw.cat sg (Hw.slice 3 9 l)))));
+  let lum := Hw.mux (neg12 v) (Hw.lit 6 0) (Hw.mux (Hw.ult v (Hw.lit 12 64)) (Hw.slice 0 6 v) (Hw.lit 6 63));
+  let sp := Hw.mux (eqLit (Hw.slice 3 3 lum) 7) (Hw.cat (Hw.slice 0 3 lum) (Hw.lit 3 0)) (Hw.lit 6 0);
+  let rr := Hw.or (shade6 (mix6 62 12 w) lum) sp;
+  let gg := Hw.or (shade6 (mix6 40 63 w) lum) sp;
+  let bb := Hw.or (shade6 (mix6 12 62 w) lum) sp;
+  let ball := rgb565 (Hw.slice 1 5 rr) gg (Hw.slice 1 5 bb);
+  -- the shadows: |x − cx| + 3 |y − 54| ≤ 12, in pixels
+  let ay := abs12 (Hw.sub (Hw.cat (Hw.lit 6 0) y) (Hw.lit 12 Sph.shadowY));
+  let ay3 := Hw.add ay (Hw.cat (Hw.slice 0 11 ay) lo);
+  let sh := fun (cx : r D12) =>
+    bnot (Hw.ult (Hw.lit 12 12) (Hw.add (abs12 (Hw.sub (Hw.cat (Hw.lit 5 0) x) (zext 2 (Hw.slice 2 10 cx)))) ay3));
+  Hw.mux s.mr.hit ball (backdrop (bor (sh sc.x1) (sh sc.x2)) x y t)
+
+------------------------------------------------------------------------------------
+-- The key: `1` … `6` keeps an effect, `0` the sequence.
+
+structure Key6 (r : HwTy → Type) where
+  sync : Sync r
+  rx : Rx r
+  lock : r Bit
+  sel : r B3
+  deriving Bundle
+
+def key6Step {r : HwTy → Type} [Hw r] (n : Nat) (k : Key6 r) (pin : r Bit) : r Key6.code :=
+  let rr := rxStep n k.rx k.sync.ff2;
+  let got := Byte.unpack (Hw.snd rr);
+  let d := got.data;
+  let digit := band got.valid (band (eqLit (Hw.slice 3 5 d) 6) (Hw.ult (Hw.slice 0 3 d) (Hw.lit 3 7)));
+  Key6.pack (Key6.mk (Sync.unpack (syncStep k.sync pin)) (Rx.unpack (Hw.fst rr))
+    (Hw.mux digit (bnot (eqLit (Hw.slice 0 3 d) 0)) k.lock)
+    (Hw.mux digit (dec (Hw.slice 0 3 d)) k.sel))
+
+------------------------------------------------------------------------------------
+-- The design.
+
+-- the effect sequence: the effect, and the frame counter's bit 9 when it last moved
+structure Seq6 (r : HwTy → Type) where
+  eff : r B3
+  t9 : r Bit
+  deriving Bundle
+
+structure Show (fl : Nat) (r : HwTy → Type) where
+  ctl : RCtl fl r
+  key : Key6 r
+  sq : Seq6 r
+  sph : Tracer r
+  a : StageA r
+  b : StageB2 r
+  fdel : r D6
+  deriving Bundle
+
+def Show.init (c : RgbCfg) : Show c.frameLog HwTy.El :=
+  Show.mk (RCtl.init c) (Key6.mk Sync.init Rx.init (BitVec.ofNat 1 0) (BitVec.ofNat 3 0))
+    (Seq6.mk (BitVec.ofNat 3 0) (BitVec.ofNat 1 0)) Tracer.init StageA.init StageB2.init (BitVec.ofNat 6 63)
+
+def showStep {r : HwTy → Type} [Hw r] (c : RgbCfg) (n : Nat) (rom : RomT) (s : Show c.frameLog r) (x : OledPins r)
+    : r (HwTy.prod (Show.code c.frameLog) RgbBoard.code) :=
+  let cs := s.ctl;
+  let g := cs.gen;
+  let t := Hw.slice 0 9 cs.fr.t;
+  let t9 := Hw.slice 9 1 cs.fr.t;
+  let moved := bnot (Hw.eq t9 s.sq.t9);
+  let effNext := Hw.mux (eqLit s.sq.eff 5) (Hw.lit 3 0) (inc s.sq.eff);
+  let e := Hw.mux s.key.lock s.key.sel s.sq.eff;
+  -- the controller's loads
+  let op := ROp.of (Rom.at 9 cs.sq.pc rom);
+  let ready := spiReady cs.spi;
+  let loadCmd := band op.cmd ready;
+  let frameGo := band op.frame (band ready (band cs.pins.cs cs.fr.pend));
+  let loadHi := band (band (bor op.blank op.pix) ready) (bnot g.half);
+  let lastX := eqLit g.x (Rgb.width - 1);
+  -- the ball's tracer: the next pixel
+  let sc := Scene.at t;
+  let tx1 := Hw.mux loadHi (Hw.mux lastX (Hw.lit 7 0) (inc g.x)) g.x;
+  let ty1 := Hw.mux (band loadHi lastX) (inc g.y) g.y;
+  let tr := s.sph;
+  let ballC := sphereColor (bnot tr.px.far) (bnot tr.px.farS) (Hw.slice 0 5 tr.rt.dd) tr.px.dx tr.px.dy g.x g.y t;
+  -- the blobs' pipeline: stage A two pixels ahead, B the next
+  let bs := BScene.at t;
+  let fStart := eqLit s.fdel 1;
+  let fShift := eqLit s.fdel 32;
+  let shift := bor loadHi fShift;
+  let n2 := nextPx 2 g.x g.y;
+  let tx2 := Hw.mux fStart (Hw.lit 7 0) (Hw.mux fShift (Hw.lit 7 1) (Hw.fst n2));
+  let ty2 := Hw.mux (bor fStart fShift) (Hw.lit 6 0) (Hw.snd n2);
+  let blobC := blob2Color s.b bs g.x g.y t;
+  -- the colour of the effect on the screen
+  let fx := rgbPixel (Hw.slice 0 2 e) g.x g.y t;
+  let color := Hw.mux (eqLit e 4) ballC (Hw.mux (eqLit e 5) blobC fx);
+  Hw.pair
+    (Show.pack c.frameLog (Show.mk (RCtl.unpack c.frameLog (rctlStep c rom cs color))
+      (Key6.unpack (key6Step n s.key x.uart_rx))
+      (Seq6.mk (Hw.mux moved effNext s.sq.eff) t9)
+      (Tracer.unpack (traceStep tr (bor loadCmd loadHi) tx1 ty1 sc))
+      (StageA.unpack (stageAStep s.a (bor fStart shift) tx2 ty2 bs))
+      (StageB2.unpack (stageB2Step s.b shift s.a.out bs))
+      (Hw.mux frameGo (Hw.lit 6 0) (Hw.mux (eqLit s.fdel 63) s.fdel (inc s.fdel)))))
+    (rgbOut cs (Hw.cat (rctlShowing cs) e))
+
+def showDesign (c : RgbCfg) (n : Nat) : Circuit OledPins.code RgbBoard.code :=
+  let rom := RProg.tree;
+  Circuit.bundled (Show.bundle c.frameLog) OledPins.bundle RgbBoard.bundle (Show.init c) (showStep c n rom)
+
+------------------------------------------------------------------------------------
+-- What a frame of `oled_show` must be (`arty gen`): the effect on the screen, pixel by
+-- pixel; the blobs by running the two stages on their own for each pixel.
+
+def Blob2Ref.runB (sc : BScene HwTy.El) (a : AOut HwTy.El) : Nat → StageB2 HwTy.El → StageB2 HwTy.El
+  | .zero, s => s
+  | .succ n, s => Blob2Ref.runB sc a n (StageB2.unpack (@stageB2Step HwTy.El _ s (BitVec.ofNat 1 0) a sc))
+
+def Blob2Ref.pixel (x y t : Nat) : Nat :=
+  let tt := BitVec.ofNat 9 t;
+  let sc := @BScene.at HwTy.El _ tt;
+  let a0 := StageA.unpack (@stageAStep HwTy.El _ StageA.init (BitVec.ofNat 1 1) (BitVec.ofNat 7 x) (BitVec.ofNat 6 y) sc);
+  let a := BlobRef.runA sc 31 a0;
+  let b0 := StageB2.unpack (@stageB2Step HwTy.El _ StageB2.init (BitVec.ofNat 1 1) a.out sc);
+  BitVec.toNat (@blob2Color HwTy.El _ (Blob2Ref.runB sc a.out 31 b0) sc (BitVec.ofNat 7 x) (BitVec.ofNat 6 y) tt)
+
+def ShowRef.pixel (e x y t : Nat) : Nat := match Nat.lt e 4, Nat.beq e 4 with
+  | .true, _ => RRef.pixel e x y t
+  | _, .true => SphRef.pixel x y t
+  | _, _ => Blob2Ref.pixel x y t
+
+def ShowRef.go (e t : Nat) : Nat → Nat → List Nat → List Nat
+  | .zero, k, acc => Hdl.reverse acc
+  | .succ n, k, acc => ShowRef.go e t n (k + 1) (.cons (ShowRef.pixel e (Nat.mod k 96) (Nat.div k 96) t) acc)
+def ShowRef.frame (e t : Nat) : List Nat := ShowRef.go e (Nat.mod t 512) Rgb.pixels 0 .nil
+
+-- the effect of frame k (1, 2, …): it moves on whenever bit 9 of the frame counter
+-- changes (t0 = 0, so it starts at 0)
+def ShowRef.effGo (c : RgbCfg) : Nat → Nat → Nat → Nat
+  | .zero, e, t => e
+  | .succ k, e, t =>
+    let t2 := Nat.mod (t + c.tStep) 2048;
+    ShowRef.effGo c k (match Nat.beq (Nat.div t 512 % 2) (Nat.div t2 512 % 2) with
+      | .true => e
+      | .false => Nat.mod (e + 1) 6) t2
+def ShowRef.eff (c : RgbCfg) (k : Nat) : Nat := ShowRef.effGo c k 0 c.t0
+
+------------------------------------------------------------------------------------
+-- The designs, and their simulations
+
+def OledArty.designs : List Design :=
+  .cons (Circuit.design "oled_test" (OledArty.onBoard (OledArty.test ArtyCfg.board)))
+  (.cons (Circuit.design "oled_demo" (OledArty.onBoard (OledArty.demo ArtyCfg.board)))
+  (.cons (Circuit.design "oled_blobs" (OledArty.onBoard (OledArty.blobs ArtyCfg.board)))
+  (.cons (Circuit.design "oled_show" (OledArty.onBoard (showDesign ArtyCfg.board OledArty.bit))) .nil)))
+
+
+def OledArty.inner (name : String) (c : RgbCfg) : Circuit OledPins.code RgbBoard.code :=
+  match Hdl.strEq name "oled_test", Hdl.strEq name "oled_demo", Hdl.strEq name "oled_show" with
+  | .true, _, _ => OledArty.test c
+  | _, .true, _ => OledArty.demo c
+  | _, _, .true => showDesign c OledArty.bit
+  | _, _, _ => OledArty.blobs c
+
+-- the frame counter's step in simulation: test 1; demo 539 (frames 1, 2: stars wiping
+-- in, the scroller wiping in); blobs 40; show 300 (frames 1 … 9 show the effects 0, 1,
+-- 1, 2, 3, 3, 4, 4, 5 as the sequence moves on)
+def OledArty.fastCfg (name : String) : RgbCfg := match Hdl.strEq name "oled_demo", Hdl.strEq name "oled_blobs", Hdl.strEq name "oled_show" with
+  | .true, _, _ => RgbCfg.fast 0 539
+  | _, .true, _ => RgbCfg.fast 0 40
+  | _, _, .true => RgbCfg.fast 0 300
+  | _, _, _ => RgbCfg.fast 0 1
+
+def OledArty.frames (name : String) : Nat := match Hdl.strEq name "oled_demo", Hdl.strEq name "oled_show" with
+  | .true, _ => 2
+  | _, .true => 9
+  | _, _ => 1
+
+def OledArty.cycles (name : String) : Nat := 200000 + OledArty.frames name * 196900 + 2000
+
+-- frame k at frame counter t
+def OledArty.ref (name : String) (k t : Nat) : List Nat :=
+  match Hdl.strEq name "oled_test", Hdl.strEq name "oled_demo", Hdl.strEq name "oled_show" with
+  | .true, _, _ => TestRef.frame
+  | _, .true, _ => RRef.frame t
+  | _, _, .true => ShowRef.frame (ShowRef.eff (OledArty.fastCfg name) k) t
+  | _, _, _ => BlobRef.frame t
+

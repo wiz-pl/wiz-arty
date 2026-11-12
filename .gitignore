@@ -4,3 +4,4 @@ build/
 .grail/
 grail.local.wiz
 bits/
+.scratch*

@@ -91,6 +91,44 @@ Until the Wiz library modules `Hdl.Xdc` and `Hdl.Arty` are on Wiz's master, use 
 checkout that has them (`grail` from its `.lake/build/bin`, which reads that checkout's
 `lib/`).
 
+## The PmodOLEDrgb on Pmod JA
+
+A Digilent PmodOLEDrgb (SSD1331 controller, 96 × 64, 16-bit colour) on header JA, driven
+by the controller, effects and ray tracers of
+[wiz-icestick-uart](../wiz-icestick-uart) (branch `oled-demo`; `src/Arty/Oled*.wiz`,
+`Fx*.wiz`, `Demo*.wiz`, `Sphere.wiz`, `Blobs.wiz` are its files with the module names
+changed), and four Arty designs (`src/Arty/OledArty.wiz`, `src/Arty/Show.wiz`):
+
+| design | what it shows |
+|---|---|
+| `oled_test` | a test pattern: white border, eight colour bars, a red-to-blue ramp, a grey ramp |
+| `oled_demo` | the iCEstick's colour slideshow: plasma, stars, sine scroller, XOR |
+| `oled_blobs` | the iCEstick's sphere tracer (two balls, smooth minimum) |
+| `oled_show` | six effects, 8 s each: the four of `oled_demo`, the ray-traced ball over a floor, and the blobs with 30 steps a pixel (both balls every cycle), the normal and colour blended by the smooth minimum's weight (DSP slices), the floor and the shadows |
+
+The OLED's eight signals are one port, `oled`, bits 0 … 7 on the Pmod's pins 1, 2, 3, 4,
+7, 8, 9, 10 (CS, MOSI, unused, SCK, D/C, RES, VCCEN, PMODEN), and `OledArty.board h`
+puts it on header `h` (`ja` … `jd`; `OledArty.defaultHeader` is `ja`).
+
+**The clock.** The circuits are the iCEstick's, run one cycle in eight (12.5 MHz,
+`Circuit.slow 3`): the SSD1331's serial clock may be at most 6.7 MHz and the serialiser
+toggles it every cycle it runs, so a full frame (96 × 64 × 16 bits) takes 15.7 ms: 63.6
+frames a second, back to back. The enable is a flip-flop (`ce`); every other register
+holds unless it is high. The XDC of these designs constrains the clock at 80 ns (eight
+periods: what the circuits' own paths have), and the one-period paths from `ce` are
+checked with `scripts/sdfpath.py` on nextpnr's SDF (`arty bit` writes
+`build/DEVICE/NAME.sdf`).
+
+**Checks** (`arty gen oled_test oled_demo oled_blobs oled_show`): each circuit is run on
+its own with short waits and frames back to back, and its pins go through the SSD1331
+model of wiz-icestick-uart (`QModel`: the serial interface, the command table with its
+argument counts, the window): the power-up in the PmodOLEDrgb's order and times, exactly
+the program's command bytes, the controller's registers as wanted, and every frame,
+12288 bytes into the whole panel, equal pixel by pixel to the effects evaluated directly
+(the frames are written as `build/frames/NAME_K_tT.ppm`). Then the slowed-down circuit
+runs 20000 cycles: the same command bytes, the reset pulse eight times as long, netlist =
+values; and the board's design itself 20000 cycles for the Verilog simulations.
+
 ## Alternatives to openXC7
 
 * **Vivado** (AMD/Xilinx, free WebPACK licence for these parts): `read_verilog

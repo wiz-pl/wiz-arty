@@ -1,4 +1,5 @@
 import Arty.Top
+import Arty.Show
 import Sys
 import Text
 -- The flow driver: `arty COMMAND [DEVICE] [--chipdb DIR] [--db DIR]`. grail builds this
@@ -15,6 +16,8 @@ import Text
 --   postsim [DEVICE]  replay the traces on the synthesised netlists (yosys's Xilinx
 --                  cell models)
 --   all [DEVICE]   gen, sim, bit, postsim
+--   (each takes design names too: only those; the OLED designs are oled_test,
+--   oled_demo, oled_blobs, src/Arty/OledArty.wiz)
 --
 -- DEVICE is a35t (the default: Arty A7-35T, xc7a35ticsg324-1L), a100t (Arty A7-100T,
 -- xc7a100tcsg324-1) or both. The chip databases of nextpnr come from --chipdb DIR (else
@@ -107,11 +110,111 @@ def genDesign (d : Design) : EIO Unit := do
   FS.writeFile (build (name <+> ".vec")) "";
   writeVec (build (name <+> ".vec")) (List.length xs) (Testbench.lines net ins ys)
 
-def gen : EIO Unit := do
+------------------------------------------------------------------------------------
+-- The PmodOLEDrgb designs (src/Arty/OledArty.wiz)
+
+-- the board of a design: the OLED designs have the OLED's port on the Pmod header and
+-- the clock constrained at their enabled rate (80 ns: one cycle in 8)
+def boardOf (name : String) : XBoard := match OledArty.isOled name with
+  | .true => OledArty.board OledArty.defaultHeader 80000
+  | .false => Arty.board
+
+def repeatList {A : Type} : Nat → List A → List A
+  | .zero, xs => .nil
+  | .succ k, xs => List.append xs (repeatList k xs)
+
+def isPrefix : List Nat → List Nat → Bool
+  | .nil, _ => .true
+  | .cons a as, .cons b bs => Bool.and (Nat.beq a b) (isPrefix as bs)
+  | .cons _ _, .nil => .false
+
+def expectRgbCmds (k : Nat) : List Nat :=
+  List.append (RProg.cmdsOf RProg.init) (repeatList k (RProg.cmdsOf RProg.loop))
+
+def oledFrames (name : String) (c : RgbCfg) : Nat → List QFrame → EIO Unit
+  | k, .nil => EIO.pure ()
+  | k, .cons f fs => do
+    let t := RRef.time c k;
+    FS.writeFile (build ("frames/" <+> name <+> "_" <+> Hdl.show k <+> "_t" <+> Hdl.show t <+> ".ppm")) (Ppm.of f.pixels);
+    check ("frame " <+> Hdl.show k <+> " (t = " <+> Hdl.show t <+> "): " <+> Hdl.show f.bytes
+      <+> " data bytes into the whole panel, every pixel as specified")
+      (Bool.and (Bool.and f.full (Nat.beq f.bytes (2 * Rgb.pixels))) (Hdl.natsEq f.pixels (OledArty.ref name k t)));
+    oledFrames name c (k + 1) fs
+
+def input1 (n : Nat) : List (List Nat) := Hdl.map (fun (b : Nat) => List.cons b List.nil) (Wave.rep n 1 .nil)
+
+def genOled (d : Design) : EIO Unit := do
+  let name := d.name;
+  let c := OledArty.fastCfg name;
+  let net := Design.netlist d;
+  say (name <+> ": " <+> Hdl.show (Netlist.size net) <+> " netlist nodes, " <+> Hdl.show (List.length net.regs)
+    <+> " registers; OLED on " <+> OledArty.defaultHeader);
+  check "every port has its pin" (match Xdc.check net (boardOf name) with
+    | .nil => .true
+    | _ => .false);
+  -- 1. the circuit on its own, short waits: the SSD1331 model on its pins
+  let ins := input1 (OledArty.cycles name);
+  let m := QModel.ofRun (Design.runLeaves (Circuit.design name (OledArty.inner name c)) ins);
+  let ts := m.times;
+  let cmds := Hdl.reverse m.cmds;
+  let frames := Hdl.reverse m.frames;
+  say ("  " <+> Hdl.show (List.length ins) <+> " cycles: PMODEN on at " <+> Hdl.show (R.get ts T.vdd) <+> ", RES "
+    <+> Hdl.show (R.get ts T.resLo) <+> " … " <+> Hdl.show (R.get ts T.resHi) <+> ", VCCEN " <+> Hdl.show (R.get ts T.vbat)
+    <+> ", display on " <+> Hdl.show (R.get ts T.on) <+> "; " <+> Hdl.show (List.length cmds) <+> " command bytes, "
+    <+> Hdl.show (List.length frames) <+> " frames");
+  check "PMODEN, then RES low for at least tRes, then the commands" (Bool.and (Nat.le (R.get ts T.vdd + c.tVdd) (R.get ts T.first))
+    (Nat.le (R.get ts T.resLo + c.tRes) (R.get ts T.resHi)));
+  check "the command bytes are the program's, in order" (isPrefix cmds (expectRgbCmds (List.length frames + 1)));
+  check "VCCEN after RES, display on at least tVcc after VCCEN"
+    (Bool.and (Nat.lt (R.get ts T.resHi) (R.get ts T.vbat)) (Nat.le (R.get ts T.vbat + c.tVcc) (R.get ts T.on)));
+  check "the SSD1331's registers as wanted" (Q.wanted m.regs);
+  check ("all " <+> Hdl.show (OledArty.frames name) <+> " frames shown") (Nat.le (OledArty.frames name) (List.length frames));
+  oledFrames name c 1 frames;
+  -- 2. the same, slowed down as on the board (one cycle in 8), for 20000 cycles
+  let slow := Circuit.design name (OledArty.onBoard (OledArty.inner name c));
+  let ins2 := input1 20000;
+  let ys2 := Design.runLeaves slow ins2;
+  let m2 := QModel.ofRun (Hdl.map OledArty.leaves ys2);
+  let cmds2 := Hdl.reverse m2.cmds;
+  check ("slowed down: " <+> Hdl.show (List.length cmds2) <+> " command bytes in 20000 cycles, the program's")
+    (Bool.and (isPrefix cmds2 (expectRgbCmds 1)) (Nat.le 30 (List.length cmds2)));
+  check "slowed down: the reset pulse 8 times as long"
+    (Nat.le (8 * c.tRes) (R.get m2.times T.resHi - R.get m2.times T.resLo));
+  check "slowed down: netlist simulation = value simulation" (leavesEq (Netlist.simulate (Design.netlist slow) ins2) ys2);
+  -- 3. the board's design: its Verilog, constraints, and a trace for the Verilog simulations
+  let ins3 := input1 20000;
+  let ys3 := Design.runLeaves d ins3;
+  check "board design: netlist simulation = value simulation (20000 cycles)" (leavesEq (Netlist.simulate net ins3) ys3);
+  FS.writeFile (build (name <+> ".xdc")) (Xdc.emit net (boardOf name));
+  FS.writeFile (build (name <+> ".v")) (Verilog.emit net);
+  FS.writeFile (build (name <+> "_tb.v")) (Testbench.verilog net (build (name <+> ".vec")) 20000);
+  FS.writeFile (build (name <+> ".vec")) "";
+  writeVec (build (name <+> ".vec")) 20000 (Testbench.lines net ins3 ys3)
+
+def allDesigns : List Design := List.append Top.designs OledArty.designs
+
+def pickGo (names : List String) : List Design → List Design
+  | .nil => .nil
+  | .cons d ds => match Hdl.member d.name names with
+    | .true => .cons d (pickGo names ds)
+    | .false => pickGo names ds
+-- the designs named (all if none is)
+def pick (names : List String) : List Design := match names with
+  | .nil => allDesigns
+  | .cons _ _ => pickGo names allDesigns
+
+def genOne (d : Design) : EIO Unit := match OledArty.isOled d.name with
+  | .true => genOled d
+  | .false => do
+    FS.writeFile (build (d.name <+> ".xdc")) (Xdc.emit (Design.netlist d) Arty.board);
+    genDesign d
+
+def gen (names : List String) : EIO Unit := do
   ensureDir "build";
-  -- every design has the same ports: one constraints file
+  ensureDir "build/frames";
+  -- the UART designs have the same ports: one constraints file for them too
   FS.writeFile (build "arty.xdc") (Xdc.emit (Design.netlist (Circuit.design "echo" (echo clocksPerBit))) Arty.board);
-  EIO.forEach genDesign Top.designs
+  EIO.forEach genOne (pick names)
 
 -- replay a trace on Verilog sources with Icarus Verilog
 def replay (std label name : String) (sources : List String) : EIO Unit := do
@@ -188,9 +291,9 @@ def synth (name : String) : EIO Unit := do
 def pnr (dirs : Dirs) (d : Arty.Device) (name : String) : EIO Unit := do
   let part := Arty.Device.xrayPart d;
   tool "nextpnr-xilinx" (.cons "--chipdb" (.cons (dirs.chipdb <+> "/" <+> Arty.Device.chipdb d <+> ".bin")
-    (.cons "--xdc" (.cons (build "arty.xdc") (.cons "--json" (.cons (build (name <+> ".json"))
+    (.cons "--xdc" (.cons (build (name <+> ".xdc")) (.cons "--json" (.cons (build (name <+> ".json"))
     (.cons "--fasm" (.cons (dev d (name <+> ".fasm")) (.cons "--log" (.cons (dev d (name <+> ".nextpnr.log"))
-    (.cons "-q" .nil)))))))))));
+    (.cons "--sdf" (.cons (dev d (name <+> ".sdf")) (.cons "-q" .nil)))))))))))));
   lg ← FS.readFile (dev d (name <+> ".nextpnr.log"));
   say (name <+> " on " <+> Arty.Device.part d <+> ": timing (nextpnr)");
   -- (nextpnr reports after placement and twice after routing: the last one counts)
@@ -202,15 +305,15 @@ def pnr (dirs : Dirs) (d : Arty.Device) (name : String) : EIO Unit := do
     (.cons "--part_name" (.cons part (.cons "--frm_file" (.cons (dev d (name <+> ".frames"))
     (.cons "--output_file" (.cons (dev d (name <+> ".bit")) .nil))))))))
 
-def bitDevice (dirs : Dirs) (d : Arty.Device) : EIO Unit := do
+def bitDevice (dirs : Dirs) (names : List String) (d : Arty.Device) : EIO Unit := do
   ensureDir (build (Arty.Device.name d));
-  EIO.forEach (fun (x : Design) => pnr dirs d (Design.name x)) Top.designs
+  EIO.forEach (fun (x : Design) => pnr dirs d (Design.name x)) (pick names)
 
-def synthAll : EIO Unit := EIO.forEach (fun (x : Design) => synth (Design.name x)) Top.designs
+def synthAll (names : List String) : EIO Unit := EIO.forEach (fun (x : Design) => synth (Design.name x)) (pick names)
 
-def bit (dirs : Dirs) (ds : List Arty.Device) : EIO Unit := do
-  synthAll;
-  EIO.forEach (bitDevice dirs) ds
+def bit (dirs : Dirs) (names : List String) (ds : List Arty.Device) : EIO Unit := do
+  synthAll names;
+  EIO.forEach (bitDevice dirs names) ds
 
 ------------------------------------------------------------------------------------
 -- postsim: the synthesised netlists (yosys's write_verilog after synth_xilinx) with
@@ -231,15 +334,15 @@ def postsimDesign (cells : String) (d : Design) : EIO Unit := do
   | .true => say ("  skipped: postsim of " <+> Design.name d <+> " (block RAM: yosys has no simulation model for it)")
   | .false => replay "-g2012" "_syn" (Design.name d) (.cons (build (Design.name d <+> "_syn.v")) (.cons cells .nil))
 
-def postsim : EIO Unit := do
+def postsim (names : List String) : EIO Unit := do
   dat ← toolOutput "yosys-config" (.cons "--datdir" .nil);
-  EIO.forEach (postsimDesign (String.mk (Chars.trim (String.chars dat)) <+> "/xilinx/cells_sim.v")) Top.designs
+  EIO.forEach (postsimDesign (String.mk (Chars.trim (String.chars dat)) <+> "/xilinx/cells_sim.v")) (pick names)
 
 ------------------------------------------------------------------------------------
 -- The command line
 
 def usage : String :=
-  "usage: arty gen | sim | bit [a35t|a100t|both] | postsim | all [a35t|a100t|both]  [--chipdb DIR] [--db DIR]"
+  "usage: arty gen | sim | bit [a35t|a100t|both] | postsim | all [a35t|a100t|both] [NAME…]  [--chipdb DIR] [--db DIR]"
 
 def envOr (k : String) (v : Option String) : EIO String := match v with
   | .some x => EIO.pure x
@@ -285,21 +388,32 @@ def dirsOf (a : Args) : EIO Dirs := do
   b ← envOr "PRJXRAY_DB_DIR" a.db;
   EIO.pure (Dirs.mk c b)
 
-def sim : EIO Unit := EIO.forEach simDesign Top.designs
+def sim (names : List String) : EIO Unit := EIO.forEach simDesign (pick names)
 
-def withDevices (rest : List String) (k : List Arty.Device → EIO Unit) : EIO Unit := match devicesOf rest with
-  | .some ds => k ds
+-- the words after the command: a device (or both) and design names, in any order
+def isDevice (w : String) : Bool := Bool.or (String.eq w "both") (match Arty.Device.ofName w with
+  | .some _ => .true
+  | .none => .false)
+def keepW (p : String → Bool) : List String → List String
+  | .nil => .nil
+  | .cons w ws => match p w with
+    | .true => .cons w (keepW p ws)
+    | .false => keepW p ws
+
+def withDevices (rest : List String) (k : List Arty.Device → List String → EIO Unit) : EIO Unit :=
+  match devicesOf (keepW isDevice rest) with
+  | .some ds => k ds (keepW (fun (w : String) => Bool.not (isDevice w)) rest)
   | .none => EIO.fail usage
 
 def runArgs (a : Args) : EIO Unit := match a.words with
   | .cons cmd rest => (match String.eq cmd "gen", String.eq cmd "sim", String.eq cmd "bit", String.eq cmd "postsim" with
-    | .true, _, _, _ => gen
-    | _, .true, _, _ => EIO.bind gen (fun u => sim)
-    | _, _, .true, _ => withDevices rest (fun ds => EIO.bind (dirsOf a) (fun dirs => bit dirs ds))
-    | _, _, _, .true => postsim
+    | .true, _, _, _ => gen rest
+    | _, .true, _, _ => EIO.bind (gen rest) (fun u => sim rest)
+    | _, _, .true, _ => withDevices rest (fun ds names => EIO.bind (dirsOf a) (fun dirs => bit dirs names ds))
+    | _, _, _, .true => postsim rest
     | _, _, _, _ => match String.eq cmd "all" with
-      | .true => withDevices rest (fun ds => EIO.bind (dirsOf a) (fun dirs =>
-          EIO.bind gen (fun u => EIO.bind sim (fun u => EIO.bind (bit dirs ds) (fun u => postsim)))))
+      | .true => withDevices rest (fun ds names => EIO.bind (dirsOf a) (fun dirs =>
+          EIO.bind (gen names) (fun u => EIO.bind (sim names) (fun u => EIO.bind (bit dirs names ds) (fun u => postsim names)))))
       | .false => EIO.fail usage)
   | .nil => EIO.fail usage
 

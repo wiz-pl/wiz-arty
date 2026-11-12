@@ -1,0 +1,141 @@
+import Arty.OledRgbSim
+-- The PmodOLEDrgb demos on the Arty A7: wiz-icestick-uart's SSD1331 controller, colour
+-- slideshow and ray tracers (`Arty.OledRgb`, `Arty.FxRgb`, `Arty.DemoRgb`,
+-- `Arty.Sphere`, `Arty.Blobs`), behind a clock enable, on a Pmod header.
+--
+-- The clock enable. The SSD1331 takes SCLK up to 6.7 MHz (150 ns a bit), and the
+-- serialiser toggles SCLK every cycle it runs, so the circuits run one cycle in 8:
+-- 12.5 MHz, close to the iCEstick's 12 MHz, with the same cycle counts per pixel. The
+-- enable is a flip-flop (`ce`) set from a 3-bit counter; every other register holds
+-- unless it is high. So the circuits' own paths have eight clock periods, and the XDC
+-- constrains the clock at 80 ns; the paths from `ce` itself (one period) are checked
+-- separately (scripts/sdfpath.py, README).
+--
+-- The header: the OLED's eight signals are one port, `oled` (bit k is the Pmod's pin 1,
+-- 2, 3, 4, 7, 8, 9, 10 for k = 0 … 7: CS, MOSI, -, SCK, D/C, RES, VCCEN, PMODEN), and
+-- `OledArty.board h` puts it on header `h` (ja, jb, jc or jd; the user's OLED is on JA).
+
+def B3 : HwTy := HwTy.bits 3
+
+-- one cycle of `c` every 2^k cycles
+def Circuit.slow {ω i o : HwTy} (k : Nat) (c : Circuit i o) : Circuit i o :=
+  Circuit.mk (HwTy.prod (HwTy.named "ce" Bit) (HwTy.prod (HwTy.named "ce_cnt" (HwTy.bits k)) c.st))
+    (BitVec.ofNat 1 0, (BitVec.ofNat k 0, c.init))
+    (fun s x =>
+      let ce := Hw.untag (Hw.fst s);
+      let cnt := Hw.untag (Hw.fst (Hw.snd s));
+      let inner := Hw.snd (Hw.snd s);
+      let rc := Circuit.inst c inner x;
+      Hw.pair
+        (Hw.pair (Hw.tag "ce" (eqLit cnt (Nat.pow 2 k - 2)))
+          (Hw.pair (Hw.tag "ce_cnt" (inc cnt)) (Hw.mux ce (Hw.fst rc) inner)))
+        (Hw.snd rc))
+
+------------------------------------------------------------------------------------
+-- Pins
+
+structure ArtyOled (r : HwTy → Type) where
+  uart_tx : r Bit
+  led : r B4
+  oled : r B8
+  deriving Bundle
+
+-- the Pmod's eight pins from the controller's outputs
+def toArty {r : HwTy → Type} [Hw r] (y : r RgbBoard.code) : r ArtyOled.code :=
+  let b := RgbBoard.unpack y;
+  ArtyOled.pack (ArtyOled.mk b.uart_tx (Hw.slice 0 4 b.leds)
+    (Hw.cat b.oled_pmoden (Hw.cat b.oled_vccen (Hw.cat b.oled_res (Hw.cat b.oled_dc
+      (Hw.cat b.oled_sclk (Hw.cat lo (Hw.cat b.oled_mosi b.oled_cs))))))))
+
+-- the pins of a Pmod header (Arty.pins: ja … jd)
+def OledArty.header (h : String) : List String := match XPin.find h Arty.pins with
+  | .some p => (match p with
+    | .bus _ ps => ps
+    | .one _ q => .cons q .nil)
+  | .none => .nil
+
+-- the board with the OLED's port on header `h`, the clock constrained at `periodPs`
+def OledArty.board (h : String) (periodPs : Nat) : XBoard :=
+  XBoard.mk "E3" periodPs "LVCMOS33" (.cons (XPin.bus "oled" (OledArty.header h)) Arty.pins)
+
+def OledArty.defaultHeader : String := "ja"
+
+-- 12.5 MHz: the UART's bit is 108 cycles (115740.7 baud: fast of the FT2232's 115384.6,
+-- as it must be: README)
+def OledArty.bit : Nat := 108
+
+------------------------------------------------------------------------------------
+-- The test pattern: a white border, eight colour bars (white, yellow, cyan, green,
+-- magenta, red, blue, black; 12 columns each) in rows 1 … 31, a red-to-blue ramp in
+-- rows 32 … 47, a grey ramp in rows 48 … 62.
+
+def testColor {r : HwTy → Type} [Hw r] (x : r D7) (y : r D6) : r (HwTy.bits 16) :=
+  let ge := fun (k : Nat) => bnot (Hw.ult x (Hw.lit 7 k));
+  let n := fun (b : r Bit) => zext 2 b;
+  let idx := Hw.add (Hw.add (Hw.add (n (ge 12)) (n (ge 24))) (Hw.add (n (ge 36)) (n (ge 48))))
+    (Hw.add (Hw.add (n (ge 60)) (n (ge 72))) (n (ge 84)));
+  let full5 := fun (b : r Bit) => Hw.mux b (Hw.lit 5 31) (Hw.lit 5 0);
+  let full6 := fun (b : r Bit) => Hw.mux b (Hw.lit 6 63) (Hw.lit 6 0);
+  let bars := rgb565 (full5 (bnot (Hw.slice 1 1 idx))) (full6 (bnot (Hw.slice 2 1 idx))) (full5 (bnot (Hw.slice 0 1 idx)));
+  let ramp := rgb565 (Hw.sub (Hw.lit 5 23) (Hw.slice 2 5 x)) (Hw.lit 6 0) (Hw.slice 2 5 x);
+  let grey := Hw.slice 1 6 x;
+  let greys := rgb565 (Hw.slice 1 5 grey) grey (Hw.slice 1 5 grey);
+  let border := bor (bor (eqLit x 0) (eqLit x 95)) (bor (eqLit y 0) (eqLit y 63));
+  Hw.mux border (Hw.lit 16 65535)
+    (Hw.mux (Hw.ult y (Hw.lit 6 32)) bars (Hw.mux (Hw.ult y (Hw.lit 6 48)) ramp greys))
+
+structure TestRgb (fl : Nat) (r : HwTy → Type) where
+  ctl : RCtl fl r
+  deriving Bundle
+
+def testStep {r : HwTy → Type} [Hw r] (c : RgbCfg) (rom : RomT) (s : TestRgb c.frameLog r) (x : OledPins r)
+    : r (HwTy.prod (TestRgb.code c.frameLog) RgbBoard.code) :=
+  let cs := s.ctl;
+  let p := cs.pins;
+  Hw.pair
+    (TestRgb.pack c.frameLog (TestRgb.mk (RCtl.unpack c.frameLog (rctlStep c rom cs (testColor cs.gen.x cs.gen.y)))))
+    (rgbOut cs (Hw.cat lo (Hw.cat lo (Hw.cat (Hw.slice 0 1 cs.fr.t) hi))))
+
+def testDesign (c : RgbCfg) : Circuit OledPins.code RgbBoard.code :=
+  let rom := RProg.tree;
+  Circuit.bundled (TestRgb.bundle c.frameLog) OledPins.bundle RgbBoard.bundle (TestRgb.mk (RCtl.init c)) (testStep c rom)
+
+------------------------------------------------------------------------------------
+-- Configurations at 12.5 MHz: 20 ms after PMODEN, a 1 ms RES pulse, 100 ms after VCCEN;
+-- frames back to back (2^17 cycles is shorter than a frame's 196608), the frame counter
+-- one step a frame (63.6 frames a second).
+def ArtyCfg.board : RgbCfg := RgbCfg.mk 250000 12500 1250000 17 0 1
+
+-- the inner circuit of each design (one cycle = one enabled cycle on the board)
+def OledArty.test (c : RgbCfg) : Circuit OledPins.code RgbBoard.code := testDesign c
+def OledArty.demo (c : RgbCfg) : Circuit OledPins.code RgbBoard.code := demoRgb c OledArty.bit
+def OledArty.blobs (c : RgbCfg) : Circuit OledPins.code RgbBoard.code := blobsDesign c
+
+-- on the board: slowed down, and the pins mapped to the header's port
+def OledArty.onBoard (c : Circuit OledPins.code RgbBoard.code) : Circuit OledPins.code ArtyOled.code :=
+  Circuit.mapOut toArty (Circuit.slow 3 c)
+
+def OledArty.isOled (name : String) : Bool := String.startsWith name "oled"
+
+------------------------------------------------------------------------------------
+-- Simulation (`arty gen`). The inner circuits run on their own (one cycle = one enabled
+-- cycle) with short waits and frames back to back (`OledArty.fastCfg`); their pins go
+-- through the SSD1331 model of `Arty.OledRgbSim`. The slowed-down circuit runs for
+-- a while too, with the same configuration, to check that the enable leaves the
+-- command stream as it is.
+
+-- the test pattern, pixel by pixel
+def TestRef.go : Nat → Nat → List Nat → List Nat
+  | .zero, k, acc => Hdl.reverse acc
+  | .succ n, k, acc => TestRef.go n (k + 1)
+      (.cons (BitVec.toNat (@testColor HwTy.El _ (BitVec.ofNat 7 (Nat.mod k 96)) (BitVec.ofNat 6 (Nat.div k 96)))) acc)
+def TestRef.frame : List Nat := TestRef.go Rgb.pixels 0 .nil
+
+-- the outputs of a board design (uart_tx, led, oled) as those of the inner circuit
+-- (uart_tx, leds, cs, mosi, sclk, dc, res, vccen, pmoden), for the model
+def OledArty.bitOf (v k : Nat) : Nat := Nat.mod (Nat.div v (Nat.pow 2 k)) 2
+def OledArty.leaves (y : List Nat) : List Nat :=
+  let o := Hdl.nthD 0 y 2;
+  .cons (Hdl.nthD 0 y 0) (.cons (Hdl.nthD 0 y 1) (.cons (OledArty.bitOf o 0) (.cons (OledArty.bitOf o 1)
+  (.cons (OledArty.bitOf o 3) (.cons (OledArty.bitOf o 4) (.cons (OledArty.bitOf o 5) (.cons (OledArty.bitOf o 6)
+  (.cons (OledArty.bitOf o 7) .nil))))))))
