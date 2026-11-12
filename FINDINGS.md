@@ -127,3 +127,22 @@ worth an upstream report. A `-nobram` build of the core (512 RAM256X1S) misses 5
   its own `XPin`. The board table lists the whole board and `Xdc.check` ignores unused
   resources. `Pcf.check` instead treats a pin for no port as an error, which makes a
   whole-board table impossible there.
+
+## The PmodOLEDrgb designs (branch `oled`)
+
+* **Porting from the iCEstick was copying.** The SSD1331 controller, the effects, the
+  ray tracers and the SSD1331 model (wiz-icestick-uart, branch `oled-demo`, written for
+  wiz b6ad475) went over with the module names changed. Two things were new: the board
+  wrapper (`Circuit.slow`: one cycle in eight behind a clock-enable flip-flop, and the
+  OLED's pins as one port put on a Pmod header by `OledArty.board`), and per-design XDC
+  files in the driver (the UART designs shared one).
+* **wiz ada3a919 cannot infer the record in `S.pack (S.mk …)` here** (it could at
+  b6ad475): in the controllers' output functions, with nine fields some of which are
+  projections of a nested bundle, `RgbBoard.pack (RgbBoard.mk hi … p.pmoden)` fails with
+  "type mismatch: expected ?m r inst c cs …, inferred (hi, …, fun fields => ())
+  (spine length mismatch)". A small repro with plain arguments elaborates. Writing the
+  type, `let b : RgbBoard r := RgbBoard.mk …; RgbBoard.pack b`, works (`rgbOut`,
+  `monoOut`).
+* **The clock enable costs nothing in timing here:** `oled_test` routes at 202 MHz
+  (constrained at 12.5 MHz, its enabled rate), so it would pass 100 MHz even as
+  single-cycle paths.

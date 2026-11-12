@@ -232,10 +232,11 @@ def ShowRef.eff (c : RgbCfg) (k : Nat) : Nat := ShowRef.effGo c k 0 c.t0
 -- The designs, and their simulations
 
 def OledArty.designs : List Design :=
-  .cons (Circuit.design "oled_test" (OledArty.onBoard (OledArty.test ArtyCfg.board)))
+  .cons (Circuit.design "probe_const" probeConst)
+  (.cons (Circuit.design "oled_test" (OledArty.onBoard (OledArty.test ArtyCfg.board)))
   (.cons (Circuit.design "oled_demo" (OledArty.onBoard (OledArty.demo ArtyCfg.board)))
   (.cons (Circuit.design "oled_blobs" (OledArty.onBoard (OledArty.blobs ArtyCfg.board)))
-  (.cons (Circuit.design "oled_show" (OledArty.onBoard (showDesign ArtyCfg.board OledArty.bit))) .nil)))
+  (.cons (Circuit.design "oled_show" (OledArty.onBoard (showDesign ArtyCfg.board OledArty.bit))) .nil))))
 
 
 def OledArty.inner (name : String) (c : RgbCfg) : Circuit OledPins.code RgbBoard.code :=

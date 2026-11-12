@@ -40,10 +40,12 @@ structure ArtyOled (r : HwTy → Type) where
   oled : r B8
   deriving Bundle
 
--- the Pmod's eight pins from the controller's outputs
+-- the Pmod's eight pins from the controller's outputs; LD4 PMODEN (on from the start),
+-- LD5 the display on, LD6 and LD7 the design's own two lowest LED bits
 def toArty {r : HwTy → Type} [Hw r] (y : r RgbBoard.code) : r ArtyOled.code :=
   let b := RgbBoard.unpack y;
-  ArtyOled.pack (ArtyOled.mk b.uart_tx (Hw.slice 0 4 b.leds)
+  ArtyOled.pack (ArtyOled.mk b.uart_tx
+    (Hw.cat (Hw.slice 1 1 b.leds) (Hw.cat (Hw.slice 0 1 b.leds) (Hw.cat (Hw.slice 4 1 b.leds) b.oled_pmoden)))
     (Hw.cat b.oled_pmoden (Hw.cat b.oled_vccen (Hw.cat b.oled_res (Hw.cat b.oled_dc
       (Hw.cat b.oled_sclk (Hw.cat lo (Hw.cat b.oled_mosi b.oled_cs))))))))
 
@@ -111,9 +113,36 @@ def OledArty.test (c : RgbCfg) : Circuit OledPins.code RgbBoard.code := testDesi
 def OledArty.demo (c : RgbCfg) : Circuit OledPins.code RgbBoard.code := demoRgb c OledArty.bit
 def OledArty.blobs (c : RgbCfg) : Circuit OledPins.code RgbBoard.code := blobsDesign c
 
--- on the board: slowed down, and the pins mapped to the header's port
+-- Every output from a flip-flop. openXC7 (nextpnr-xilinx, as pinned) leaves an output
+-- buffer whose input is a constant undriven: the first `oled_test` had LD4 (constant 1)
+-- dark (FINDINGS.md, UPSTREAM.md). So the outputs go through a register each, which
+-- starts from `init`; a constant 1 comes from a flip-flop that starts at 0 (and a
+-- constant 0 from one that starts at 1), which yosys cannot fold away.
+def Circuit.regOut {ω i o : HwTy} (init : HwTy.El o) (c : Circuit i o) : Circuit i o :=
+  Circuit.mk (HwTy.prod c.st (HwTy.named "out_reg" o)) (c.init, init)
+    (fun s x =>
+      let rc := Circuit.inst c (Hw.fst s) x;
+      Hw.pair (Hw.pair (Hw.fst rc) (Hw.tag "out_reg" (Hw.snd rc))) (Hw.untag (Hw.snd s)))
+
+-- the output registers' first values: all 0 but the unused Pmod pin 3 (constant 0)
+def OledArty.outInit : HwTy.El ArtyOled.code :=
+  Bundle.toEl ArtyOled.bundle (ArtyOled.mk (BitVec.ofNat 1 0) (BitVec.ofNat 4 0) (BitVec.ofNat 8 4))
+
+-- on the board: slowed down, the pins mapped to the header's port, registered
 def OledArty.onBoard (c : Circuit OledPins.code RgbBoard.code) : Circuit OledPins.code ArtyOled.code :=
-  Circuit.mapOut toArty (Circuit.slow 3 c)
+  Circuit.regOut OledArty.outInit (Circuit.mapOut toArty (Circuit.slow 3 c))
+
+-- A probe for the constant-output problem (Board's pins: uart_tx, LD4 … LD7): LD4 a
+-- constant 1, LD5 a 26-bit counter's top bit (0.75 Hz), LD6 a flip-flop that starts at 1
+-- and stays there (its next value is itself or a counter bit), LD7 a constant 0.
+def probeConst : Circuit Pins.code Board.code :=
+  Circuit.mk (HwTy.prod (HwTy.named "cnt" (HwTy.bits 26)) (HwTy.named "one" Bit))
+    (BitVec.ofNat 26 0, BitVec.ofNat 1 1)
+    (fun s x =>
+      let c := Hw.untag (Hw.fst s);
+      let one := Hw.untag (Hw.snd s);
+      Hw.pair (Hw.pair (Hw.tag "cnt" (inc c)) (Hw.tag "one" (bor one (Hw.slice 3 1 c))))
+        (board hi (Hw.cat lo (Hw.cat one (Hw.cat (Hw.slice 25 1 c) hi)))))
 
 def OledArty.isOled (name : String) : Bool := String.startsWith name "oled"
 
