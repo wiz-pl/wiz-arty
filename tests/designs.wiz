@@ -1,0 +1,38 @@
+-- test: run
+import Arty.Top
+import IO
+-- The designs, simulated at values with a fast UART (16 cycles per bit instead of 866:
+-- the same circuits with other constants; `arty gen` runs them at the board's divider):
+-- `hello` with a short pause (2^10 cycles instead of 2^25) twice; `blinky`'s LEDs (the
+-- top four bits of a 27-bit counter) around a wrap; `echo` and `squares` (each byte
+-- twice: the second time its square comes back).
+
+def fast : Nat := 16
+
+def showBytes : List Nat → String
+  | .nil => ""
+  | .cons x xs => String.mk (.cons (Char.mk (match Nat.lt x 32 with
+      | .true => 46
+      | .false => x)) .nil) <+> showBytes xs
+def showNats : List Nat → String
+  | .nil => ""
+  | .cons x xs => Hdl.show x <+> " " <+> showNats xs
+
+def twice : List Nat :=
+  Wave.decode fast 1 (Sim.txLine (Sim.run (hello fast 10) (Wave.rep 7000 1 .nil)))
+
+-- the LEDs after 5 cycles from a counter value
+def blinkyFrom (start cycles : Nat) : Nat :=
+  NatList.last 0 (Sim.leds (Sim.go blinky (BitVec.ofNat 27 start) (Wave.rep cycles 1 .nil)))
+
+def replies (c : Circuit Pins.code Board.code) (bytes : List Nat) : List Nat :=
+  Wave.decode fast 1 (Sim.txLine (Sim.run c (Wave.events fast 1
+    (.cons (Ev.idle 30) (Ev.bytes bytes (.cons (Ev.idle 400) .nil))))))
+
+def main : IO Unit := do
+  IO.println (showBytes twice);
+  IO.println ("leds after 5 cycles from 0x0FFFFFE: " <+> Hdl.show (blinkyFrom 16777214 5));
+  IO.println ("leds after 5 cycles from 0x7FFFFFE: " <+> Hdl.show (blinkyFrom 134217726 5));
+  IO.println ("echo: " <+> showNats (replies (echo fast) (.cons 0 (.cons 85 (.cons 170 (.cons 255 .nil))))));
+  IO.println ("squares: " <+> showNats (replies (squares fast) Scenario.squareBytes));
+  IO.println ("squares expected: " <+> showNats (Top.expect "squares"))

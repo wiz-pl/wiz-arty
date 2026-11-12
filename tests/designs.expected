@@ -1,0 +1,6 @@
+Hello from Wiz!..Hello from Wiz!..
+leds after 5 cycles from 0x0FFFFFE: 2
+leds after 5 cycles from 0x7FFFFFE: 0
+echo: 0 85 170 255 
+squares: 0 0 9 0 0 64 0 33 0 1 
+squares expected: 0 0 9 0 0 64 0 33 0 1 

@@ -1,0 +1,53 @@
+import Hdl.Arty
+-- Small vocabulary on top of `Hdl.Core`'s `Hw` operations, shared by every design here
+-- (as in wiz-icestick-uart's Icestick.Gates). Everything is polymorphic in the
+-- representation `r`, so it simulates (`HwTy.El`) and synthesises (`Wire`) from the
+-- same text.
+
+def Bit : HwTy := HwTy.bits 1
+def B4 : HwTy := HwTy.bits 4
+def B5 : HwTy := HwTy.bits 5
+def B8 : HwTy := HwTy.bits 8
+def B9 : HwTy := HwTy.bits 9
+-- the baud counters: 866 cycles per bit need ten bits
+def B10 : HwTy := HwTy.bits 10
+
+def hi {r : HwTy → Type} [Hw r] : r Bit := Hw.lit 1 1
+def lo {r : HwTy → Type} [Hw r] : r Bit := Hw.lit 1 0
+
+def band {r : HwTy → Type} [Hw r] (a b : r Bit) : r Bit := Hw.and a b
+def bor {r : HwTy → Type} [Hw r] (a b : r Bit) : r Bit := Hw.or a b
+def bnot {r : HwTy → Type} [Hw r] (a : r Bit) : r Bit := Hw.not a
+
+-- `x == k`, `x + 1` and `x - 1` at any width
+def eqLit {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (HwTy.bits n)) (k : Nat) : r Bit :=
+  Hw.eq x (Hw.lit n k)
+def inc {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (HwTy.bits n)) : r (HwTy.bits n) :=
+  Hw.add x (Hw.lit n 1)
+def dec {r : HwTy → Type} [Hw r] {ω n : Nat} (x : r (HwTy.bits n)) : r (HwTy.bits n) :=
+  Hw.sub x (Hw.lit n 1)
+
+-- Shift registers, least significant bit first: `b` comes in at the top.
+def frame9 {r : HwTy → Type} [Hw r] (d : r B8) : r B9 := Hw.cat (Hw.lit 1 1) d
+def shiftIn9 {r : HwTy → Type} [Hw r] (x : r B9) (b : r Bit) : r B9 := Hw.cat b (Hw.slice 1 8 x)
+def shiftIn8 {r : HwTy → Type} [Hw r] (x : r B8) (b : r Bit) : r B8 := Hw.cat b (Hw.slice 1 7 x)
+
+-- A read-only memory as a chain of multiplexers: entry `k` of the list at index `k`.
+def rom {r : HwTy → Type} [Hw r] (idx : r B5) : Nat → List Nat → r B8
+  | _, .nil => Hw.lit 8 0
+  | k, .cons c cs => Hw.mux (eqLit idx k) (Hw.lit 8 c) (rom idx (Nat.succ k) cs)
+
+------------------------------------------------------------------------------------
+-- The board's resources the designs use, as bundles, by their names in `Arty.pins`
+-- (lib/Hdl/Arty.wiz): the UART's two lines and the four green LEDs LD4 … LD7.
+
+structure Pins (r : HwTy → Type) where
+  uart_rx : r Bit
+  deriving Bundle
+
+structure Board (r : HwTy → Type) where
+  uart_tx : r Bit
+  led : r B4
+  deriving Bundle
+
+def board {r : HwTy → Type} [Hw r] (line : r Bit) (led : r B4) : r Board.code := Board.pack (Board.mk line led)

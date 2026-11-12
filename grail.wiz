@@ -1,0 +1,8 @@
+import Grail
+-- `grail build`: check the library (the designs) and compile the flow driver,
+-- `.grail/bin/arty` (see app/arty.wiz for its commands).
+-- `grail test`: the simulation tests under tests/.
+def package : Package := Package.new "arty"
+  |> Package.lib "lib" "src"
+  |> Package.exe "arty" "app/arty.wiz"
+  |> Package.tests "tests" "tests"

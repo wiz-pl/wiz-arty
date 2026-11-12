@@ -1,0 +1,114 @@
+import Arty.Gates
+-- An 8N1 UART: a baud divider, a transmitter and a receiver, as step functions over
+-- bundles (structures of signals), and as circuits. `n` is the number of clock cycles per
+-- bit, a meta-level `Nat`: it only ends up in the netlist as the constants the counters
+-- are compared with.
+--
+-- (wiz-icestick-uart's Icestick.Uart with ten-bit baud counters.) On the Arty:
+-- 100 MHz / 866 = 115473.4 baud (`clocksPerBit` in src/Arty/Designs.wiz says why not 868).
+
+------------------------------------------------------------------------------------
+-- The baud divider: a 10-bit counter that counts 0 … n-1 (n ≤ 1024); `tick` is high in
+-- the last cycle of each period.
+
+def baudStep {r : HwTy → Type} [Hw r] (n : Nat) (c : r B10) : r (HwTy.prod B10 Bit) :=
+  let t := Hw.label "tick" (eqLit c (n - 1));
+  Hw.pair (Hw.mux t (Hw.lit 10 0) (inc c)) t
+
+------------------------------------------------------------------------------------
+-- The transmitter. State: the line (a register of its own, so the pin is driven by a
+-- flip-flop and cannot glitch), the number of bit periods left (0: idle), the baud
+-- counter, and a 9-bit shift register (stop bit on top of the data, least significant
+-- bit first; ones are shifted in).
+--
+-- `start` with `data` is taken when idle and ignored otherwise.
+
+structure Tx (r : HwTy → Type) where
+  line : r Bit
+  left : r B4
+  cnt : r B10
+  sh : r B9
+  deriving Bundle
+
+def Tx.init : Tx HwTy.El := Tx.mk (BitVec.ofNat 1 1) (BitVec.ofNat 4 0) (BitVec.ofNat 10 0) (BitVec.ofNat 9 511)
+
+def txIdle {r : HwTy → Type} [Hw r] (s : Tx r) : r Bit := eqLit s.left 0
+
+def txStep {r : HwTy → Type} [Hw r] (n : Nat) (s : Tx r) (start : r Bit) (d : r B8) : r Tx.code :=
+  let idle := txIdle s;
+  let go := band idle start;
+  let b := baudStep n s.cnt;
+  let tick := band (bnot idle) (Hw.snd b);
+  Tx.pack (Tx.mk
+    (Hw.mux go lo (Hw.mux tick (Hw.slice 0 1 s.sh) s.line))
+    (Hw.mux go (Hw.lit 4 10) (Hw.mux tick (dec s.left) s.left))
+    (Hw.mux go (Hw.lit 10 0) (Hw.fst b))
+    (Hw.mux go (frame9 d) (Hw.mux tick (shiftIn9 s.sh hi) s.sh)))
+
+------------------------------------------------------------------------------------
+-- The receiver. State: the phase (0: idle, 10: in the start bit, 9 … 2: data bits,
+-- 1: stop bit), the baud counter and the shift register.
+--
+-- A low line when idle starts a frame; half a bit later the line must still be low
+-- (otherwise it was a glitch), and from there the line is sampled once per bit period,
+-- i.e. in the middle of each bit. `valid` is high for one cycle, at the sample of a
+-- stop bit that is high, and `data` is the byte then.
+
+structure Rx (r : HwTy → Type) where
+  ph : r B4
+  cnt : r B10
+  sh : r B8
+  deriving Bundle
+
+structure Byte (r : HwTy → Type) where
+  valid : r Bit
+  data : r B8
+  deriving Bundle
+
+def Rx.init : Rx HwTy.El := Rx.mk (BitVec.ofNat 4 0) (BitVec.ofNat 10 0) (BitVec.ofNat 8 0)
+
+def rxStep {r : HwTy → Type} [Hw r] (n : Nat) (s : Rx r) (rx : r Bit) : r (HwTy.prod Rx.code Byte.code) :=
+  let idle := eqLit s.ph 0;
+  let inStart := eqLit s.ph 10;
+  let inStop := eqLit s.ph 1;
+  let fall := band idle (bnot rx);
+  let startTick := band inStart (eqLit s.cnt (Nat.div n 2 - 1));
+  let tick := band (bnot idle) (band (bnot inStart) (eqLit s.cnt (n - 1)));
+  let ph := Hw.mux fall (Hw.lit 4 10)
+    (Hw.mux startTick (Hw.mux rx (Hw.lit 4 0) (Hw.lit 4 9)) (Hw.mux tick (dec s.ph) s.ph));
+  let cnt := Hw.mux (bor fall (bor startTick tick)) (Hw.lit 10 0) (inc s.cnt);
+  let sh := Hw.mux (band tick (bnot inStop)) (shiftIn8 s.sh rx) s.sh;
+  Hw.pair (Rx.pack (Rx.mk ph cnt sh)) (Byte.pack (Byte.mk (band tick (band inStop rx)) s.sh))
+
+------------------------------------------------------------------------------------
+-- The input synchroniser: the RX pin is asynchronous to the clock, so it goes through
+-- two flip-flops before anything looks at it. Both idle high.
+
+structure Sync (r : HwTy → Type) where
+  ff1 : r Bit
+  ff2 : r Bit
+  deriving Bundle
+
+def Sync.init : Sync HwTy.El := Sync.mk (BitVec.ofNat 1 1) (BitVec.ofNat 1 1)
+def syncStep {r : HwTy → Type} [Hw r] (s : Sync r) (pin : r Bit) : r Sync.code := Sync.pack (Sync.mk pin s.ff1)
+
+------------------------------------------------------------------------------------
+-- The same parts as circuits, for composition: the transmitter (input: start and the
+-- byte; output: the line), the synchroniser, the receiver (output: valid and the byte).
+
+structure Send (r : HwTy → Type) where
+  start : r Bit
+  data : r B8
+  deriving Bundle
+structure Line (r : HwTy → Type) where
+  line : r Bit
+  deriving Bundle
+
+def txC (n : Nat) : Circuit Send.code Line.code :=
+  Circuit.bundled Tx.bundle Send.bundle Line.bundle Tx.init
+    (fun s x => Hw.pair (txStep n s x.start x.data) (Line.pack (Line.mk s.line)))
+def syncC : Circuit Line.code Line.code :=
+  Circuit.bundled Sync.bundle Line.bundle Line.bundle Sync.init
+    (fun s x => Hw.pair (syncStep s x.line) (Line.pack (Line.mk s.ff2)))
+def rxC (n : Nat) : Circuit Line.code Byte.code :=
+  Circuit.bundled Rx.bundle Line.bundle Byte.bundle Rx.init (fun s x => rxStep n s x.line)

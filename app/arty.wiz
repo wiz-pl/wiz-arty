@@ -1,0 +1,304 @@
+import Arty.Top
+import Sys
+import Text
+-- The flow driver: `arty COMMAND [DEVICE] [--chipdb DIR] [--db DIR]`. grail builds this
+-- program (and checks the library); it writes the Verilog and runs the FPGA tools
+-- (the openXC7 flow) as child processes.
+--
+--   gen            write build/*.v, build/arty.xdc, test benches and traces, after
+--                  simulating every design (values and netlist) and checking the bytes
+--                  it sends
+--   sim            gen, then replay the traces on the Verilog with Icarus Verilog
+--   bit [DEVICE]   synthesise (yosys synth_xilinx), place and route (nextpnr-xilinx),
+--                  make the bitstream (fasm2frames, xc7frames2bit): build/DEVICE/NAME.bit,
+--                  with the utilisation (yosys) and the timing (nextpnr) of each
+--   postsim [DEVICE]  replay the traces on the synthesised netlists (yosys's Xilinx
+--                  cell models)
+--   all [DEVICE]   gen, sim, bit, postsim
+--
+-- DEVICE is a35t (the default: Arty A7-35T, xc7a35ticsg324-1L), a100t (Arty A7-100T,
+-- xc7a100tcsg324-1) or both. The chip databases of nextpnr come from --chipdb DIR (else
+-- $ARTY_CHIPDB), Project X-Ray's database from --db DIR (else $PRJXRAY_DB_DIR, the
+-- directory that holds artix7/); the devShell sets both variables.
+--
+-- There is no `flash`: openFPGALoader -b arty build/a35t/NAME.bit would do it.
+
+------------------------------------------------------------------------------------
+-- Steps (as wiz-icestick-uart's driver)
+
+def unwords : List String → String
+  | .nil => ""
+  | .cons a as => a <+> " " <+> unwords as
+
+def say (s : String) : EIO Unit := EIO.lift (IO.println s)
+
+def EIO.forEach {A : Type} (f : A → EIO Unit) : List A → EIO Unit
+  | .nil => EIO.pure ()
+  | .cons x xs => EIO.bind (f x) (fun u => EIO.forEach f xs)
+
+-- run a tool with this program's streams; a failure stops the flow
+def tool (cmd : String) (args : List String) : EIO Unit := do
+  say ("$ " <+> cmd <+> " " <+> unwords args);
+  st ← Process.run cmd args;
+  match ExitStatus.success st with
+  | .true => EIO.pure ()
+  | .false => EIO.fail (cmd <+> ": " <+> ExitStatus.toString st)
+
+-- run a tool and return what it printed
+def toolOutput (cmd : String) (args : List String) : EIO String := do
+  say ("$ " <+> cmd <+> " " <+> unwords args);
+  o ← Process.output cmd args "";
+  match ExitStatus.success o.status with
+  | .true => EIO.pure o.stdout
+  | .false => EIO.fail (cmd <+> ": " <+> ExitStatus.toString o.status <+> "\n" <+> o.stdout <+> o.stderr)
+
+def ensureDir (p : String) : EIO Unit := do
+  d ← EIO.lift (FS.isDir p);
+  match d with
+  | .true => EIO.pure ()
+  | .false => FS.createDir p
+
+def build (file : String) : String := "build/" <+> file
+
+-- the vector file, 4096 lines at a time
+def takeDrop {A : Type} : Nat → List A → List A → List A × List A
+  | .zero, xs, acc => (Hdl.reverse acc, xs)
+  | .succ k, .nil, acc => (Hdl.reverse acc, .nil)
+  | .succ k, .cons x xs, acc => takeDrop k xs (.cons x acc)
+def writeVec (path : String) : Nat → List String → EIO Unit
+  | .zero, _ => EIO.pure ()
+  | .succ fuel, ls => match ls with
+    | .nil => EIO.pure ()
+    | .cons _ _ =>
+      let ω r := takeDrop 4096 ls .nil;
+      EIO.bind (FS.appendFile path (Hdl.concat r.1)) (fun u => writeVec path fuel r.2)
+
+def leavesEq : List (List Nat) → List (List Nat) → Bool
+  | .nil, .nil => .true
+  | .cons a as, .cons b bs => Bool.and (Hdl.natsEq a b) (leavesEq as bs)
+  | _, _ => .false
+
+def check (what : String) (ok : Bool) : EIO Unit := match ok with
+  | .true => say ("  ok: " <+> what)
+  | .false => EIO.fail ("FAILED: " <+> what)
+
+------------------------------------------------------------------------------------
+-- gen, sim
+
+def genDesign (d : Design) : EIO Unit := do
+  let name := d.name;
+  let xs := Top.input name;
+  let ins := Hdl.map (fun (b : Nat) => List.cons b List.nil) xs;
+  let net := Design.netlist d;
+  say (name <+> ": " <+> Hdl.show (Netlist.size net) <+> " netlist nodes, "
+    <+> Hdl.show (List.length net.regs) <+> " registers, " <+> Hdl.show (List.length net.mems) <+> " memories, "
+    <+> Hdl.show (List.length xs) <+> " cycles");
+  check "every port has its pin" (match Xdc.check net Arty.board with
+    | .nil => .true
+    | _ => .false);
+  let ys := Design.runLeaves d ins;
+  -- the first output port is `uart_tx`
+  let got := Wave.decode clocksPerBit 1 (Hdl.map (fun (y : List Nat) => Hdl.nthD 0 y 0) ys);
+  check ("value simulation sends the expected " <+> Hdl.show (List.length (Top.expect name)) <+> " bytes")
+    (Hdl.natsEq got (Top.expect name));
+  check ("netlist simulation = value simulation (all cycles)") (leavesEq (Netlist.simulate net ins) ys);
+  FS.writeFile (build (name <+> ".v")) (Verilog.emit net);
+  FS.writeFile (build (name <+> "_tb.v")) (Testbench.verilog net (build (name <+> ".vec")) (List.length xs));
+  FS.writeFile (build (name <+> ".vec")) "";
+  writeVec (build (name <+> ".vec")) (List.length xs) (Testbench.lines net ins ys)
+
+def gen : EIO Unit := do
+  ensureDir "build";
+  -- every design has the same ports: one constraints file
+  FS.writeFile (build "arty.xdc") (Xdc.emit (Design.netlist (Circuit.design "echo" (echo clocksPerBit))) Arty.board);
+  EIO.forEach genDesign Top.designs
+
+-- replay a trace on Verilog sources with Icarus Verilog
+def replay (std label name : String) (sources : List String) : EIO Unit := do
+  tool "iverilog" (.cons std (.cons "-o" (.cons (build (name <+> label <+> ".vvp"))
+    (.cons (build (name <+> "_tb.v")) sources))));
+  out ← toolOutput "vvp" (.cons "-n" (.cons (build (name <+> label <+> ".vvp")) .nil));
+  say out;
+  check ("Verilog simulation" <+> label <+> " of " <+> name <+> " = value simulation")
+    (String.contains out ("PASS " <+> name))
+
+def simDesign (d : Design) : EIO Unit :=
+  replay "-g2005" "" d.name (.cons (build (Design.name d <+> ".v")) .nil)
+
+------------------------------------------------------------------------------------
+-- bit: yosys, nextpnr-xilinx, fasm2frames, xc7frames2bit
+
+structure Dirs where
+  chipdb : String
+  db : String
+
+def lines (s : String) : List String := String.splitOn s "\n"
+def keep (p : String → Bool) : List String → List String
+  | .nil => .nil
+  | .cons l ls => match p l with
+    | .true => .cons l (keep p ls)
+    | .false => keep p ls
+def sayAll : List String → EIO Unit
+  | .nil => EIO.pure ()
+  | .cons l ls => EIO.bind (say ("  " <+> String.trim l)) (fun u => sayAll ls)
+
+-- the cells yosys's `stat` counts that matter here (the I/O buffers and the clock
+-- buffer are there for every design)
+def cellLine (l : String) : Bool :=
+  List.any (fun (c : String) => String.contains l c)
+    (.cons "LUT" (.cons "FD" (.cons "CARRY4" (.cons "RAMB" (.cons "DSP48E1" (.cons "RAM32" (.cons "RAM64"
+    (.cons "SRL" (.cons "MUXF" .nil)))))))))
+def timingLine (l : String) : Bool := String.contains l "Max frequency for clock"
+def lastOf : List String → List String
+  | .nil => .nil
+  | .cons l .nil => .cons l .nil
+  | .cons _ ls => lastOf ls
+
+-- yosys's DSP mapping (xilinx_dsp) can leave a flip-flop whose register it copied into
+-- a DSP48E1 with INIT x. nextpnr writes such a flip-flop with its primitive's default
+-- (FDRE, FDCE: 0; FDSE, FDPE: 1); the simulation models say x. The synthesised netlist
+-- gets the same defaults, so that postsim simulates what the bitstream holds; the count
+-- is reported.
+def xInit1 (prim v : String) (acc : String × Nat) : String × Nat :=
+  let ω pat := prim <+> " #(\n    .INIT(1'hx)";
+  let ω parts := String.splitOn acc.1 pat;
+  (String.intercalate (prim <+> " #(\n    .INIT(1'h" <+> v <+> ")") parts, acc.2 + (List.length parts - 1))
+def xInits (v : String) : String × Nat :=
+  xInit1 "FDPE" "1" (xInit1 "FDSE" "1" (xInit1 "FDCE" "0" (xInit1 "FDRE" "0" (v, 0))))
+
+def dev (d : Arty.Device) (file : String) : String := build (Arty.Device.name d <+> "/" <+> file)
+
+def synth (name : String) : EIO Unit := do
+  tool "yosys" (.cons "-q" (.cons "-l" (.cons (build (name <+> ".yosys.log")) (.cons "-p"
+    (.cons ("synth_xilinx -flatten -abc9 -arch xc7 -top " <+> name <+> "; tee -q -o " <+> build (name <+> ".stat")
+      <+> " stat; write_json " <+> build (name <+> ".json")
+      <+> "; write_verilog -noattr " <+> build (name <+> "_syn.v"))
+    (.cons (build (name <+> ".v")) .nil))))));
+  st ← FS.readFile (build (name <+> ".stat"));
+  say (name <+> ": utilisation (yosys)");
+  sayAll (keep cellLine (lines st));
+  syn ← FS.readFile (build (name <+> "_syn.v"));
+  let fixed := xInits syn;
+  (match Nat.beq fixed.2 0 with
+    | .true => EIO.pure ()
+    | .false => say ("  " <+> Hdl.show fixed.2 <+> " flip-flops lost their initial value in synthesis (INIT x);"
+        <+> " given their primitive's default for postsim, as nextpnr does in the bitstream"));
+  FS.writeFile (build (name <+> "_syn.v")) fixed.1
+
+def pnr (dirs : Dirs) (d : Arty.Device) (name : String) : EIO Unit := do
+  let part := Arty.Device.xrayPart d;
+  tool "nextpnr-xilinx" (.cons "--chipdb" (.cons (dirs.chipdb <+> "/" <+> Arty.Device.chipdb d <+> ".bin")
+    (.cons "--xdc" (.cons (build "arty.xdc") (.cons "--json" (.cons (build (name <+> ".json"))
+    (.cons "--fasm" (.cons (dev d (name <+> ".fasm")) (.cons "--log" (.cons (dev d (name <+> ".nextpnr.log"))
+    (.cons "-q" .nil)))))))))));
+  lg ← FS.readFile (dev d (name <+> ".nextpnr.log"));
+  say (name <+> " on " <+> Arty.Device.part d <+> ": timing (nextpnr)");
+  -- (nextpnr reports after placement and twice after routing: the last one counts)
+  sayAll (lastOf (keep timingLine (lines lg)));
+  fr ← toolOutput "fasm2frames" (.cons "--part" (.cons part (.cons "--db-root" (.cons (dirs.db <+> "/artix7")
+    (.cons (dev d (name <+> ".fasm")) .nil)))));
+  FS.writeFile (dev d (name <+> ".frames")) fr;
+  tool "xc7frames2bit" (.cons "--part_file" (.cons (dirs.db <+> "/artix7/" <+> part <+> "/part.yaml")
+    (.cons "--part_name" (.cons part (.cons "--frm_file" (.cons (dev d (name <+> ".frames"))
+    (.cons "--output_file" (.cons (dev d (name <+> ".bit")) .nil))))))))
+
+def bitDevice (dirs : Dirs) (d : Arty.Device) : EIO Unit := do
+  ensureDir (build (Arty.Device.name d));
+  EIO.forEach (fun (x : Design) => pnr dirs d (Design.name x)) Top.designs
+
+def synthAll : EIO Unit := EIO.forEach (fun (x : Design) => synth (Design.name x)) Top.designs
+
+def bit (dirs : Dirs) (ds : List Arty.Device) : EIO Unit := do
+  synthAll;
+  EIO.forEach (bitDevice dirs) ds
+
+------------------------------------------------------------------------------------
+-- postsim: the synthesised netlists (yosys's write_verilog after synth_xilinx) with
+-- yosys's models of the Xilinx cells
+
+def Chars.trim : List Char → List Char
+  | .nil => .nil
+  | .cons c cs => match Nat.lt (Char.code c) 33 with
+    | .true => .nil
+    | .false => .cons c (Chars.trim cs)
+
+def postsimDesign (cells : String) (d : Design) : EIO Unit :=
+  replay "-g2012" "_syn" (Design.name d) (.cons (build (Design.name d <+> "_syn.v")) (.cons cells .nil))
+
+def postsim : EIO Unit := do
+  dat ← toolOutput "yosys-config" (.cons "--datdir" .nil);
+  EIO.forEach (postsimDesign (String.mk (Chars.trim (String.chars dat)) <+> "/xilinx/cells_sim.v")) Top.designs
+
+------------------------------------------------------------------------------------
+-- The command line
+
+def usage : String :=
+  "usage: arty gen | sim | bit [a35t|a100t|both] | postsim | all [a35t|a100t|both]  [--chipdb DIR] [--db DIR]"
+
+def envOr (k : String) (v : Option String) : EIO String := match v with
+  | .some x => EIO.pure x
+  | .none => do
+    e ← EIO.lift (Env.get k);
+    match e with
+    | .some x => EIO.pure x
+    | .none => EIO.fail ("no --" <+> (match String.eq k "ARTY_CHIPDB" with
+      | .true => "chipdb"
+      | .false => "db") <+> " DIR and no $" <+> k <+> " (the devShell sets it)")
+
+structure Args where
+  words : List String
+  chipdb : Option String
+  db : Option String
+
+-- the option whose value comes next
+inductive Want where
+  | word
+  | chipdb
+  | db
+
+def parse : List String → Want → Args → Option Args
+  | .nil, .word, a => .some (Args.mk (List.reverse a.words) a.chipdb a.db)
+  | .nil, _, a => .none
+  | .cons w ws, .chipdb, a => parse ws .word (Args.mk a.words (.some w) a.db)
+  | .cons w ws, .db, a => parse ws .word (Args.mk a.words a.chipdb (.some w))
+  | .cons w ws, .word, a => match String.eq w "--chipdb", String.eq w "--db" with
+    | .true, _ => parse ws .chipdb a
+    | _, .true => parse ws .db a
+    | _, _ => parse ws .word (Args.mk (.cons w a.words) a.chipdb a.db)
+
+def devicesOf : List String → Option (List Arty.Device)
+  | .nil => .some (.cons Arty.Device.default .nil)
+  | .cons w _ => match String.eq w "both" with
+    | .true => .some Arty.devices
+    | .false => match Arty.Device.ofName w with
+      | .some d => .some (.cons d .nil)
+      | .none => .none
+
+def dirsOf (a : Args) : EIO Dirs := do
+  c ← envOr "ARTY_CHIPDB" a.chipdb;
+  b ← envOr "PRJXRAY_DB_DIR" a.db;
+  EIO.pure (Dirs.mk c b)
+
+def sim : EIO Unit := EIO.forEach simDesign Top.designs
+
+def withDevices (rest : List String) (k : List Arty.Device → EIO Unit) : EIO Unit := match devicesOf rest with
+  | .some ds => k ds
+  | .none => EIO.fail usage
+
+def runArgs (a : Args) : EIO Unit := match a.words with
+  | .cons cmd rest => (match String.eq cmd "gen", String.eq cmd "sim", String.eq cmd "bit", String.eq cmd "postsim" with
+    | .true, _, _, _ => gen
+    | _, .true, _, _ => EIO.bind gen (fun u => sim)
+    | _, _, .true, _ => withDevices rest (fun ds => EIO.bind (dirsOf a) (fun dirs => bit dirs ds))
+    | _, _, _, .true => postsim
+    | _, _, _, _ => match String.eq cmd "all" with
+      | .true => withDevices rest (fun ds => EIO.bind (dirsOf a) (fun dirs =>
+          EIO.bind gen (fun u => EIO.bind sim (fun u => EIO.bind (bit dirs ds) (fun u => postsim)))))
+      | .false => EIO.fail usage)
+  | .nil => EIO.fail usage
+
+def run (args : List String) : EIO Unit := match parse args .word (Args.mk .nil .none .none) with
+  | .some a => runArgs a
+  | .none => EIO.fail usage
+
+def main : IO Unit := EIO.toIO (EIO.bind (EIO.lift IO.args) run)

@@ -1,0 +1,6 @@
+.gcroots/
+.nix-profile*
+build/
+.grail/
+grail.local.wiz
+bits/

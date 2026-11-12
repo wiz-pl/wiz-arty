@@ -1,0 +1,50 @@
+import Arty.Designs
+import Arty.Wave
+-- The designs for the board, and for each what the host sends and what must come back
+-- (as wiz-icestick-uart's Icestick.Board; the pin table is `Arty.pins`, lib/Hdl/Arty.wiz).
+
+def Top.designs : List Design :=
+  .cons (Circuit.design "blinky" blinky)
+  (.cons (Circuit.design "hello" (hello clocksPerBit 25))   -- a pause of 2^25 cycles: 0.34 s
+  (.cons (Circuit.design "echo" (echo clocksPerBit))
+  (.cons (Circuit.design "squares" (squares clocksPerBit)) .nil)))
+
+-- the host's bit period in clock cycles, as a fraction: the FT2232's 115384.6 baud
+-- (`Ftdi.divisor`, src/Arty/Designs.wiz) at 100 MHz is 2600/3 cycles
+def Host.num : Nat := Arty.clockHz * Ftdi.divisor 115200
+def Host.den : Nat := Ftdi.base
+
+def Scenario.echoBytes : List Nat := Gen.bytes Gen.anyByte 16 99
+-- each byte twice, some of them far apart; 0 and 255 too
+def Scenario.squareBytes : List Nat :=
+  .cons 3 (.cons 200 (.cons 3 (.cons 17 (.cons 0 (.cons 200 (.cons 255 (.cons 17 (.cons 0 (.cons 255 .nil)))))))))
+
+-- What `squares` sends back: for each byte, the low byte of its square if it came
+-- before, else 0 (the RAM starts cleared). `seen` holds the bytes so far.
+def Sq.member (b : Nat) : List Nat → Bool
+  | .nil => .false
+  | .cons c cs => Bool.or (Nat.beq b c) (Sq.member b cs)
+def Sq.replies : List Nat → List Nat → List Nat
+  | _, .nil => .nil
+  | seen, .cons b bs => .cons (match Sq.member b seen with
+      | .true => Nat.mod (b * b) 256
+      | .false => 0) (Sq.replies (.cons b seen) bs)
+
+-- the RX pin, cycle by cycle, by design name
+def Top.input (name : String) : List Nat := match Hdl.strEq name "echo", Hdl.strEq name "squares" with
+  -- back to back, then time for the last one to come back
+  | .true, _ => Wave.events Host.num Host.den
+      (.cons (Ev.idle 30) (Ev.bytes Scenario.echoBytes (.cons (Ev.idle 10000) .nil)))
+  | _, .true => Wave.events Host.num Host.den
+      (.cons (Ev.idle 30) (Ev.bytes Scenario.squareBytes (.cons (Ev.idle 10000) .nil)))
+  | _, _ => match Hdl.strEq name "hello" with
+    | .true => Wave.rep 150000 1 .nil
+    | .false => Wave.rep 20000 1 .nil
+
+-- the bytes the board must send
+def Top.expect (name : String) : List Nat := match Hdl.strEq name "echo", Hdl.strEq name "squares" with
+  | .true, _ => Scenario.echoBytes
+  | _, .true => Sq.replies .nil Scenario.squareBytes
+  | _, _ => match Hdl.strEq name "hello" with
+    | .true => helloText
+    | .false => .nil

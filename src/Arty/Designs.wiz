@@ -1,0 +1,140 @@
+import Arty.Uart
+-- The designs, ported from wiz-icestick-uart (Icestick.Designs). Each is a
+-- `Circuit Pins.code Board.code`: the input is the UART RX pin (`uart_rx`), the outputs
+-- are the UART TX pin (`uart_tx`) and the four green LEDs (`led`, LD4 … LD7). `n` is the
+-- number of clock cycles per UART bit.
+
+def B27 : HwTy := HwTy.bits 27
+
+------------------------------------------------------------------------------------
+-- 1. blinky: a 27-bit counter, its top four bits on the LEDs (LD7 blinks at
+--    100 MHz / 2^27 = 0.75 Hz, as the iCEstick's LED5 at 12 MHz / 2^24). The TX line
+--    idles high.
+
+def blinky : Circuit Pins.code Board.code :=
+  Circuit.mk (HwTy.named "count" B27) (BitVec.ofNat 27 0)
+    (fun s x => Hw.pair (Hw.tag "count" (inc (Hw.untag s))) (board hi (Hw.slice 23 4 (Hw.untag s))))
+
+------------------------------------------------------------------------------------
+-- 2. hello: send a fixed string, wait 2^g cycles, again. The LEDs show the index.
+
+def helloText : List Nat :=   -- "Hello from Wiz!\r\n"
+  .cons 72 (.cons 101 (.cons 108 (.cons 108 (.cons 111 (.cons 32 (.cons 102 (.cons 114
+  (.cons 111 (.cons 109 (.cons 32 (.cons 87 (.cons 105 (.cons 122 (.cons 33 (.cons 13
+  (.cons 10 .nil))))))))))))))))
+
+structure Hello (g : Nat) (r : HwTy → Type) where
+  tx : Tx r
+  idx : r B5
+  timer : r (HwTy.bits g)
+  deriving Bundle
+
+def helloStep {r : HwTy → Type} [Hw r] (n g : Nat) (s : Hello g r) : r (HwTy.prod (Hello.code g) Board.code) :=
+  let sending := Hw.ult s.idx (Hw.lit 5 (List.length helloText));
+  let go := band sending (txIdle s.tx);
+  let again := band (bnot sending) (eqLit s.timer (Nat.pow 2 g - 1));
+  Hw.pair
+    (Hello.pack g (Hello.mk (Tx.unpack (txStep n s.tx go (rom s.idx 0 helloText)))
+      (Hw.mux go (inc s.idx) (Hw.mux again (Hw.lit 5 0) s.idx))
+      (Hw.mux sending (Hw.lit g 0) (inc s.timer))))
+    (board s.tx.line (Hw.slice 0 4 s.idx))
+
+def hello (n g : Nat) : Circuit Pins.code Board.code :=
+  Circuit.bundled (Hello.bundle g) Pins.bundle Board.bundle (Hello.mk Tx.init (BitVec.ofNat 5 0) (BitVec.ofNat g 0))
+    (fun s x => helloStep n g s)
+
+------------------------------------------------------------------------------------
+-- 3. echo: every byte received is sent back. One byte can wait while the transmitter
+--    is busy. The LEDs show the low four bits of the last byte.
+
+structure Echo (r : HwTy → Type) where
+  sync : Sync r
+  rx : Rx r
+  tx : Tx r
+  pending : r Bit
+  byte : r B8
+  deriving Bundle
+
+def echoStep {r : HwTy → Type} [Hw r] (n : Nat) (s : Echo r) (x : Pins r) : r (HwTy.prod Echo.code Board.code) :=
+  let rr := rxStep n s.rx s.sync.ff2;
+  let got := Byte.unpack (Hw.snd rr);
+  let send := band s.pending (txIdle s.tx);
+  Hw.pair
+    (Echo.pack (Echo.mk (Sync.unpack (syncStep s.sync x.uart_rx)) (Rx.unpack (Hw.fst rr))
+      (Tx.unpack (txStep n s.tx send s.byte))
+      (Hw.mux got.valid hi (Hw.mux send lo s.pending))
+      (Hw.mux got.valid got.data s.byte)))
+    (board s.tx.line (Hw.slice 0 4 s.byte))
+
+def echo (n : Nat) : Circuit Pins.code Board.code :=
+  Circuit.bundled Echo.bundle Pins.bundle Board.bundle
+    (Echo.mk Sync.init Rx.init Tx.init (BitVec.ofNat 1 0) (BitVec.ofNat 8 0)) (echoStep n)
+
+------------------------------------------------------------------------------------
+-- 4. squares: block RAM and a DSP slice on the board. Every byte `b` received is
+--    multiplied by itself (`b * b`, sixteen bits, the multiplier: DSP48E1) and the low
+--    byte of the square is stored at address `b` of a 1024-byte RAM (RAMB18E1); the byte
+--    sent back is what that address held before (0 the first time). So sending a byte
+--    twice gives its square's low byte the second time. The LEDs show the high four
+--    bits of the last square.
+--
+--    The RAM's read is registered, with an enable (block RAM's read-before-write and
+--    its read enable); the square is registered too (the DSP's output register), one
+--    cycle after the byte.
+
+def B16 : HwTy := HwTy.bits 16
+def SqRam : HwTy := HwTy.mem 10 8
+
+structure Squares (r : HwTy → Type) where
+  sync : Sync r
+  rx : Rx r
+  tx : Tx r
+  cells : r SqRam
+  addr : r B8        -- the byte being stored
+  sq : r B16         -- its square
+  store : r Bit      -- `sq` is ready: write it, read what was there
+  old : r B8         -- the RAM's read register
+  pending : r Bit    -- `old` is to be sent
+  deriving Bundle
+
+def ext10 {r : HwTy → Type} [Hw r] (b : r B8) : r B10 := Hw.cat (Hw.lit 2 0) b
+def ext16 {r : HwTy → Type} [Hw r] (b : r B8) : r B16 := Hw.cat (Hw.lit 8 0) b
+
+def squaresStep {r : HwTy → Type} [Hw r] (n : Nat) (s : Squares r) (x : Pins r) : r (HwTy.prod Squares.code Board.code) :=
+  let rr := rxStep n s.rx s.sync.ff2;
+  let got := Byte.unpack (Hw.snd rr);
+  let send := band s.pending (txIdle s.tx);
+  Hw.pair
+    (Squares.pack (Squares.mk (Sync.unpack (syncStep s.sync x.uart_rx)) (Rx.unpack (Hw.fst rr))
+      (Tx.unpack (txStep n s.tx send s.old))
+      (Hw.memWrite s.cells s.store (ext10 s.addr) (Hw.slice 0 8 s.sq))
+      (Hw.mux got.valid got.data s.addr)
+      (Hw.mul (ext16 got.data) (ext16 got.data))
+      got.valid
+      (Hw.mux s.store (Hw.memRead s.cells (ext10 s.addr)) s.old)
+      (Hw.mux s.store hi (Hw.mux send lo s.pending))))
+    (board s.tx.line (Hw.slice 12 4 s.sq))
+
+def SqRam.zeros : HwTy.El SqRam := fun (a : BitVec 10) => BitVec.ofNat 8 0
+
+def squares (n : Nat) : Circuit Pins.code Board.code :=
+  Circuit.bundled Squares.bundle Pins.bundle Board.bundle
+    (Squares.mk Sync.init Rx.init Tx.init SqRam.zeros (BitVec.ofNat 8 0) (BitVec.ofNat 16 0)
+      (BitVec.ofNat 1 0) (BitVec.ofNat 8 0) (BitVec.ofNat 1 0))
+    (squaresStep n)
+
+------------------------------------------------------------------------------------
+
+-- The UART's clock divider, computed from the host's real rate. An FT2232 (the Arty's
+-- USB-UART) makes a baud rate from 3 MHz by an integer divisor: "115200" is 3 MHz / 26 =
+-- 115384.6 baud, 0.16 % fast. `echo` buffers one byte, so the board must send at least
+-- as fast as the host sends, or it falls behind and drops a byte now and then in a long
+-- burst. With 868 (100 MHz / 115200, rounded) it dropped one byte in every 2200 or so on
+-- the board (2026-11-12). So the divider is the host's bit period in clock cycles rounded
+-- down: the board is a little fast of the host, never slow. (The iCEstick's
+-- 12 MHz / 104 = 115384.6 baud is exactly the FT2232's rate, which is why it never
+-- showed there.)
+def Ftdi.base : Nat := 3000000
+def Ftdi.divisor (baud : Nat) : Nat := Nat.div (Ftdi.base + Nat.div baud 2) baud
+-- 100 MHz / 866 = 115473.4 baud, 0.08 % fast of the FT2232
+def clocksPerBit : Nat := Nat.div (Arty.clockHz * Ftdi.divisor 115200) Ftdi.base
