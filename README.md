@@ -102,7 +102,21 @@ checkout that has them (`grail` from its `.lake/build/bin`, which reads that che
   the Arty A7-35T is one of its reference boards. Installed through conda rather than Nix;
   not tried here.
 
-## Not done here
+## On the board
 
-No flashing (`openFPGALoader -b arty build/a35t/NAME.bit` would load it into the FPGA's
-SRAM; `-f` writes the flash), and so no test on the board.
+```sh
+openFPGALoader -b arty_a7_35t build/a35t/NAME.bit     # SRAM (volatile); -f would write the flash
+```
+
+With a second FTDI device on the same bus (an iCEstick), `--ftdi-serial` failed
+(libftdi -9); `--busdev-num BUS:DEV` (from `/sys/bus/usb/devices/*/busnum,devnum`)
+works. The UART is `/dev/serial/by-id/usb-Digilent_Digilent_USB_Device_*-if01-port0`.
+
+Results on an Arty A7-35T (2026-11-12, SRAM loads):
+
+| design | check | result |
+|---|---|---|
+| `blinky` | LEDs, UART | LD4-LD7 count in binary; UART silent |
+| `hello` | UART for 3 s | 8 × `Hello from Wiz!\r\n`, nothing else |
+| `echo` | a string; 256 byte values; 4096 random bytes ×3; 32768 random bytes | all identical (with divider 866; see above) |
+| `squares` | 10 bytes, then all 256 values twice | exactly as specified (RAMB18E1, DSP48E1) |
