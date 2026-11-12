@@ -107,8 +107,8 @@ nextpnr reports the worst path per clock and takes `set_multicycle_path` only by
 destination cell, so a half-rate design (2-cycle paths everywhere except from the
 enable flip-flop) cannot be checked with one constraint. What worked: constrain the clock
 at the half rate (20 ns), then bound the 1-cycle paths from the enable flip-flop with a
-longest-path search over nextpnr's `--sdf` output (`scripts`-style, in the agent's
-scratch: about 6.5 ns, under 10 ns). nextpnr's SDF attributes some pins of fractured LUT
+longest-path search over nextpnr's `--sdf` output (`scripts/sdfpath.py FILE.sdf
+FF_CELL`: about 6.5 ns, under 10 ns). nextpnr's SDF attributes some pins of fractured LUT
 pairs (O5/O6 of one site) to the wrong LUT, which shows up as a fake two-LUT loop. That is
 worth an upstream report. A `-nobram` build of the core (512 RAM256X1S) misses 50 MHz
 (48 MHz).
