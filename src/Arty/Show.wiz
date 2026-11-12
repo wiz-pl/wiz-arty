@@ -185,10 +185,10 @@ def showStep {r : HwTy → Type} [Hw r] (c : RgbCfg) (n : Nat) (rom : RomT) (s :
       (StageA.unpack (stageAStep s.a (bor fStart shift) tx2 ty2 bs))
       (StageB2.unpack (stageB2Step s.b shift s.a.out bs))
       (Hw.mux frameGo (Hw.lit 6 0) (Hw.mux (eqLit s.fdel 63) s.fdel (inc s.fdel)))))
-    (rgbOut cs (Hw.cat (rctlShowing cs) e))
+    (rgbOut (RProg.frameAt c) cs (Hw.cat (rctlShowing (RProg.frameAt c) cs) e))
 
 def showDesign (c : RgbCfg) (n : Nat) : Circuit OledPins.code RgbBoard.code :=
-  let rom := RProg.tree;
+  let rom := RProg.tree c;
   Circuit.bundled (Show.bundle c.frameLog) OledPins.bundle RgbBoard.bundle (Show.init c) (showStep c n rom)
 
 ------------------------------------------------------------------------------------
@@ -233,14 +233,19 @@ def ShowRef.eff (c : RgbCfg) (k : Nat) : Nat := ShowRef.effGo c k 0 c.t0
 
 def OledArty.designs : List Design :=
   .cons (Circuit.design "probe_const" probeConst)
+  (.cons (Circuit.design "oled_novcc" (OledArty.onBoardNoVcc (OledArty.test ArtyCfg.board)))
+  (.cons (Circuit.design "oled_softpmod" (Circuit.softPower .true .false (OledArty.onBoard (OledArty.test ArtyCfg.soft))))
+  (.cons (Circuit.design "oled_softvcc" (Circuit.softPower .false .true (OledArty.onBoard (OledArty.test ArtyCfg.soft))))
+  (.cons (Circuit.design "oled_soft" (Circuit.softPower .true .true (OledArty.onBoard (OledArty.test ArtyCfg.soft))))
+  (.cons (Circuit.design "oled_gentle" (Circuit.softPower .false .true (OledArty.onBoard (OledArty.test ArtyCfg.gentle))))
   (.cons (Circuit.design "oled_test" (OledArty.onBoard (OledArty.test ArtyCfg.board)))
   (.cons (Circuit.design "oled_demo" (OledArty.onBoard (OledArty.demo ArtyCfg.board)))
   (.cons (Circuit.design "oled_blobs" (OledArty.onBoard (OledArty.blobs ArtyCfg.board)))
-  (.cons (Circuit.design "oled_show" (OledArty.onBoard (showDesign ArtyCfg.board OledArty.bit))) .nil))))
+  (.cons (Circuit.design "oled_show" (OledArty.onBoard (showDesign ArtyCfg.board OledArty.bit))) .nil)))))))))
 
 
 def OledArty.inner (name : String) (c : RgbCfg) : Circuit OledPins.code RgbBoard.code :=
-  match Hdl.strEq name "oled_test", Hdl.strEq name "oled_demo", Hdl.strEq name "oled_show" with
+  match Bool.or (Hdl.strEq name "oled_test") (Bool.or (Hdl.strEq name "oled_novcc") (Bool.or (Hdl.strEq name "oled_gentle") (String.startsWith name "oled_soft"))), Hdl.strEq name "oled_demo", Hdl.strEq name "oled_show" with
   | .true, _, _ => OledArty.test c
   | _, .true, _ => OledArty.demo c
   | _, _, .true => showDesign c OledArty.bit
@@ -253,7 +258,9 @@ def OledArty.fastCfg (name : String) : RgbCfg := match Hdl.strEq name "oled_demo
   | .true, _, _ => RgbCfg.fast 0 539
   | _, .true, _ => RgbCfg.fast 0 40
   | _, _, .true => RgbCfg.fast 0 300
-  | _, _, _ => RgbCfg.fast 0 1
+  | _, _, _ => match Hdl.strEq name "oled_gentle" with
+    | .true => RgbCfg.mk 50 40 200 8 0 1 .true
+    | .false => RgbCfg.fast 0 1
 
 def OledArty.frames (name : String) : Nat := match Hdl.strEq name "oled_demo", Hdl.strEq name "oled_show" with
   | .true, _ => 2
@@ -264,7 +271,7 @@ def OledArty.cycles (name : String) : Nat := 200000 + OledArty.frames name * 196
 
 -- frame k at frame counter t
 def OledArty.ref (name : String) (k t : Nat) : List Nat :=
-  match Hdl.strEq name "oled_test", Hdl.strEq name "oled_demo", Hdl.strEq name "oled_show" with
+  match Bool.or (Hdl.strEq name "oled_test") (Bool.or (Hdl.strEq name "oled_novcc") (Bool.or (Hdl.strEq name "oled_gentle") (String.startsWith name "oled_soft"))), Hdl.strEq name "oled_demo", Hdl.strEq name "oled_show" with
   | .true, _, _ => TestRef.frame
   | _, .true, _ => RRef.frame t
   | _, _, .true => ShowRef.frame (ShowRef.eff (OledArty.fastCfg name) k) t

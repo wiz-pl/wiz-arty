@@ -25,15 +25,16 @@ structure RgbCfg where
   frameLog : Nat  -- a frame starts at most every 2^frameLog cycles
   t0 : Nat        -- the frame counter's first value
   tStep : Nat     -- added to it for every frame shown
+  gentle : Bool   -- turn the panel on at the lowest current and contrast, then raise them
 
 -- The board: 20 ms after PMODEN (Digilent's PmodOLEDrgb driver waits 20 ms), a RES pulse of
 -- 1 ms (the SSD1331 asks at least 3 µs) and 1 ms after it, 100 ms between VCCEN and
 -- display on (PmodOLEDrgb reference manual, power-on sequence), a frame every 2^18 cycles
 -- (45.8 frames a second; a frame is 12288 bytes, 196608 cycles at 6 MHz), the frame
 -- counter stepping by 2 (the effects move as fast as on the monochrome panel at 91.6).
-def RgbCfg.board : RgbCfg := RgbCfg.mk 240000 12000 1200000 18 0 2
+def RgbCfg.board : RgbCfg := RgbCfg.mk 240000 12000 1200000 18 0 2 .false
 -- For simulations: short waits (the RES pulse still above 3 µs), frames back to back.
-def RgbCfg.fast (t0 tStep : Nat) : RgbCfg := RgbCfg.mk 50 40 200 8 t0 tStep
+def RgbCfg.fast (t0 tStep : Nat) : RgbCfg := RgbCfg.mk 50 40 200 8 t0 tStep .false
 
 def Rgb.width : Nat := 96
 def Rgb.height : Nat := 64
@@ -147,14 +148,26 @@ def RProg.power : List RStep :=
   .cons RStep.vddOn (.cons RStep.waitVdd (.cons RStep.resLow (.cons RStep.waitRes
     (.cons RStep.resHigh (.cons RStep.waitRes .nil)))))
 
-def RProg.finish : List RStep :=
-  RProg.window (.cons RStep.blank (.cons RStep.vccOn (.cons RStep.waitVcc (.cons (RStep.send S1331.displayOn) .nil))))
+def RProg.finish (rest : List RStep) : List RStep :=
+  RProg.window (.cons RStep.blank (.cons RStep.vccOn (.cons RStep.waitVcc (.cons (RStep.send S1331.displayOn) rest))))
 
-def RProg.init : List RStep := List.append RProg.power (RProg.sends RProg.settings RProg.finish)
+-- `gentle`: the panel comes on at the lowest master current (87 00) and low contrasts,
+-- then the current goes up in four steps a `tVdd` apart, then the usual contrasts
+-- (for a supply that sags when the panel comes on: the Arty on USB power, README)
+def RProg.low : List S1331 :=
+  .cons (S1331.current 0) (.cons (S1331.contrastA 16) (.cons (S1331.contrastB 8) (.cons (S1331.contrastC 16) .nil)))
+def RProg.ramp : List RStep :=
+  .cons RStep.waitVdd (.cons (RStep.send (S1331.current 1)) (.cons RStep.waitVdd (.cons (RStep.send (S1331.current 2))
+  (.cons RStep.waitVdd (.cons (RStep.send (S1331.current 4)) (.cons RStep.waitVdd
+  (RProg.sends (.cons (S1331.current 6) (.cons (S1331.contrastA 145) (.cons (S1331.contrastB 80) (.cons (S1331.contrastC 125) .nil)))) .nil)))))))
+
+def RProg.init (c : RgbCfg) : List RStep := match c.gentle with
+  | .false => List.append RProg.power (RProg.sends RProg.settings (RProg.finish .nil))
+  | .true => List.append RProg.power (RProg.sends RProg.settings (RProg.sends RProg.low (RProg.finish RProg.ramp)))
 
 def RProg.loop : List RStep := .cons RStep.frame (RProg.window (.cons RStep.pixels (.cons RStep.again .nil)))
 
-def RProg.steps : List RStep := List.append RProg.init RProg.loop
+def RProg.steps (c : RgbCfg) : List RStep := List.append (RProg.init c) RProg.loop
 
 def RProg.entries : List RStep → List Nat
   | .nil => .nil
@@ -162,9 +175,9 @@ def RProg.entries : List RStep → List Nat
     | .send c => List.append (S1331.bytes c) (RProg.entries ss)
     | _ => .cons (256 + RStep.code s) (RProg.entries ss)
 
-def RProg.rom : List Nat := RProg.entries RProg.steps
-def RProg.frameAt : Nat := List.length (RProg.entries RProg.init)
-def RProg.tree : RomT := RomT.build 7 RProg.rom
+def RProg.rom (c : RgbCfg) : List Nat := RProg.entries (RProg.steps c)
+def RProg.frameAt (c : RgbCfg) : Nat := List.length (RProg.entries (RProg.init c))
+def RProg.tree (c : RgbCfg) : RomT := RomT.build 7 (RProg.rom c)
 
 def RProg.cmdsOf : List RStep → List Nat
   | .nil => .nil
@@ -221,8 +234,8 @@ def RCtl.init (c : RgbCfg) : RCtl c.frameLog HwTy.El :=
     (RGen.mk (BitVec.ofNat 7 0) (BitVec.ofNat 6 0) (BitVec.ofNat 1 0) (BitVec.ofNat 8 0))
     Spi.init
 
-def rctlShowing {r : HwTy → Type} [Hw r] {ω fl : Nat} (s : RCtl fl r) : r Bit :=
-  bnot (Hw.ult s.sq.pc (Hw.lit 7 RProg.frameAt))
+def rctlShowing {r : HwTy → Type} [Hw r] (fa : Nat) {ω fl : Nat} (s : RCtl fl r) : r Bit :=
+  bnot (Hw.ult s.sq.pc (Hw.lit 7 fa))
 
 -- the step's decoded entry
 structure ROp (r : HwTy → Type) where
@@ -270,7 +283,7 @@ def rctlStep {r : HwTy → Type} [Hw r] (c : RgbCfg) (rom : RomT) (s : RCtl c.fr
   let nextPix := band loadData g.half;
   RCtl.pack c.frameLog (RCtl.mk
     (RSeq.mk
-      (Hw.mux (band ready op.again) (Hw.lit 7 RProg.frameAt) (Hw.mux adv (inc sq.pc) sq.pc))
+      (Hw.mux (band ready op.again) (Hw.lit 7 (RProg.frameAt c)) (Hw.mux adv (inc sq.pc) sq.pc))
       (band op.wait (band ready (bnot waitDone)))
       (Hw.mux (band op.wait (bnot sq.armed)) waitLen (Hw.mux (eqLit sq.wait 0) sq.wait (dec sq.wait))))
     (RPins.mk

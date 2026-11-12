@@ -203,8 +203,8 @@ def sphereStep {r : HwTy → Type} [Hw r] (c : RgbCfg) (rom : RomT) (s : SphereD
   Hw.pair
     (SphereDemo.pack c.frameLog (SphereDemo.mk (RCtl.unpack c.frameLog (rctlStep c rom cs color))
       (Tracer.unpack (traceStep tr (bor loadCmd loadHi) tx ty sc))))
-    (rgbOut cs bar)
+    (rgbOut (RProg.frameAt c) cs bar)
 
 def sphereDesign (c : RgbCfg) : Circuit OledPins.code RgbBoard.code :=
-  let rom := RProg.tree;
+  let rom := RProg.tree c;
   Circuit.bundled (SphereDemo.bundle c.frameLog) OledPins.bundle RgbBoard.bundle (SphereDemo.init c) (sphereStep c rom)

@@ -146,3 +146,22 @@ worth an upstream report. A `-nobram` build of the core (512 RAM256X1S) misses 5
 * **The clock enable costs nothing in timing here:** `oled_test` routes at 202 MHz
   (constrained at 12.5 MHz, its enabled rate), so it would pass 100 MHz even as
   single-cycle paths.
+* **On USB power alone the Arty resets when the PmodOLEDrgb's panel supply comes on**
+  (2026-11-12). `oled_test` loaded fine (DONE lit), then within a second the board's
+  FT2232 dropped off USB and re-enumerated (kernel log: "USB disconnect", a new device
+  number) and the FPGA came back from its flash: all user LEDs dark, nothing on the OLED.
+  It happened at both `oled_test` loads and not for `probe_const`. A gate-level
+  simulation of the synthesised `oled_test` (yosys's cell models, 16 million cycles)
+  was right throughout, and `probe_const` (a constant 1, a blinking counter bit, a
+  flip-flop starting at 1, a constant 0 on LD4 … LD7) showed constant outputs work: the
+  first suspicion, an undriven constant output buffer, was wrong. `oled_novcc` (the same
+  design with VCCEN held low: PMODEN, reset, commands and frames as usual, no panel
+  supply) ran with no re-enumeration and the LEDs as designed. So the brown-out comes
+  from turning on VCCEN (the module's ~13 V boost for the panel). The iCEstick drove the
+  same module from USB without trouble.
+  Written but not built or tried (the work stopped there): `oled_softvcc` (VCCEN
+  pulse-width modulated at 24 kHz with a duty rising over 42 ms), `oled_softpmod`,
+  `oled_soft`, and `oled_gentle` (`RgbCfg.gentle`: the panel turned on at the lowest
+  master current and contrasts with GRAM black and the display off, then the current
+  raised in four steps 60 ms apart). An external supply (barrel jack) would avoid the
+  question; the user has none.

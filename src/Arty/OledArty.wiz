@@ -96,17 +96,21 @@ def testStep {r : HwTy → Type} [Hw r] (c : RgbCfg) (rom : RomT) (s : TestRgb c
   let p := cs.pins;
   Hw.pair
     (TestRgb.pack c.frameLog (TestRgb.mk (RCtl.unpack c.frameLog (rctlStep c rom cs (testColor cs.gen.x cs.gen.y)))))
-    (rgbOut cs (Hw.cat lo (Hw.cat lo (Hw.cat (Hw.slice 0 1 cs.fr.t) hi))))
+    (rgbOut (RProg.frameAt c) cs (Hw.cat lo (Hw.cat lo (Hw.cat (Hw.slice 0 1 cs.fr.t) hi))))
 
 def testDesign (c : RgbCfg) : Circuit OledPins.code RgbBoard.code :=
-  let rom := RProg.tree;
+  let rom := RProg.tree c;
   Circuit.bundled (TestRgb.bundle c.frameLog) OledPins.bundle RgbBoard.bundle (TestRgb.mk (RCtl.init c)) (testStep c rom)
 
 ------------------------------------------------------------------------------------
 -- Configurations at 12.5 MHz: 20 ms after PMODEN, a 1 ms RES pulse, 100 ms after VCCEN;
 -- frames back to back (2^17 cycles is shorter than a frame's 196608), the frame counter
 -- one step a frame (63.6 frames a second).
-def ArtyCfg.board : RgbCfg := RgbCfg.mk 250000 12500 1250000 17 0 1
+def ArtyCfg.board : RgbCfg := RgbCfg.mk 250000 12500 1250000 17 0 1 .false
+-- with the soft start: 60 ms after PMODEN (its ramp is 42 ms)
+def ArtyCfg.soft : RgbCfg := RgbCfg.mk 750000 12500 1250000 17 0 1 .false
+-- and the panel turned on gently (`RgbCfg.gentle`: four steps of 60 ms)
+def ArtyCfg.gentle : RgbCfg := RgbCfg.mk 750000 12500 1250000 17 0 1 .true
 
 -- the inner circuit of each design (one cycle = one enabled cycle on the board)
 def OledArty.test (c : RgbCfg) : Circuit OledPins.code RgbBoard.code := testDesign c
@@ -127,6 +131,55 @@ def Circuit.regOut {ω i o : HwTy} (init : HwTy.El o) (c : Circuit i o) : Circui
 -- the output registers' first values: all 0 but the unused Pmod pin 3 (constant 0)
 def OledArty.outInit : HwTy.El ArtyOled.code :=
   Bundle.toEl ArtyOled.bundle (ArtyOled.mk (BitVec.ofNat 1 0) (BitVec.ofNat 4 0) (BitVec.ofNat 8 4))
+
+-- VCCEN held low: the panel's supply (its ~13 V boost) never comes on; the logic runs
+-- as usual (for telling a supply problem from a logic one)
+def noVcc {r : HwTy → Type} [Hw r] (y : r ArtyOled.code) : r ArtyOled.code :=
+  let b := ArtyOled.unpack y;
+  ArtyOled.pack (ArtyOled.mk b.uart_tx b.led (Hw.cat (Hw.slice 7 1 b.oled) (Hw.cat lo (Hw.slice 0 6 b.oled))))
+
+def OledArty.onBoardNoVcc (c : Circuit OledPins.code RgbBoard.code) : Circuit OledPins.code ArtyOled.code :=
+  Circuit.regOut OledArty.outInit (Circuit.mapOut noVcc (Circuit.mapOut toArty (Circuit.slow 3 c)))
+
+-- Soft start for the module's two supply switches. On USB power alone the Arty resets
+-- when the PmodOLEDrgb's supplies come on at once (README). So PMODEN and/or VCCEN,
+-- once the controller turns them on, are pulse-width modulated for 2^22 cycles
+-- (42 ms at 100 MHz) with a duty cycle rising from 0 to 1, then left on: PMODEN at
+-- 390 kHz (8-bit PWM: the module's load switch charging its capacitors in small
+-- steps), VCCEN at 24 kHz (12-bit). The controller's own waits must outlast the ramps
+-- (`ArtyCfg.soft`: 60 ms after PMODEN; VCCEN has 100 ms anyway).
+structure Soft (r : HwTy → Type) where
+  pwm : r (HwTy.bits 12)
+  rampP : r (HwTy.bits 22)
+  rampV : r (HwTy.bits 22)
+  deriving Bundle
+
+def Soft.init : Soft HwTy.El := Soft.mk (BitVec.ofNat 12 0) (BitVec.ofNat 22 0) (BitVec.ofNat 22 0)
+
+-- the next ramp count while `on` (it stops at the top), and the gated enable
+def rampNext {r : HwTy → Type} [Hw r] (on : r Bit) (c : r (HwTy.bits 22)) : r (HwTy.bits 22) :=
+  Hw.mux (bor (bnot on) (eqLit c 4194303)) c (inc c)
+
+def Circuit.softPower {ω i : HwTy} (softP softV : Bool) (c : Circuit i ArtyOled.code) : Circuit i ArtyOled.code :=
+  Circuit.mk (HwTy.prod c.st Soft.code) (c.init, Bundle.toEl Soft.bundle Soft.init)
+    (fun s x =>
+      let rc := Circuit.inst c (Hw.fst s) x;
+      let o := ArtyOled.unpack (Hw.snd rc);
+      let sf := Soft.unpack (Hw.snd s);
+      let pm := Hw.slice 7 1 o.oled;
+      let vc := Hw.slice 6 1 o.oled;
+      let doneP := eqLit sf.rampP 4194303;
+      let doneV := eqLit sf.rampV 4194303;
+      let gP := band pm (bor doneP (Hw.ult (Hw.slice 0 8 sf.pwm) (Hw.slice 14 8 sf.rampP)));
+      let gV := band vc (bor doneV (Hw.ult sf.pwm (Hw.cat (Hw.slice 14 8 sf.rampV) (Hw.lit 4 0))));
+      let pOut := match softP with
+        | .true => gP
+        | .false => pm;
+      let vOut := match softV with
+        | .true => gV
+        | .false => vc;
+      Hw.pair (Hw.pair (Hw.fst rc) (Soft.pack (Soft.mk (inc sf.pwm) (rampNext pm sf.rampP) (rampNext vc sf.rampV))))
+        (ArtyOled.pack (ArtyOled.mk o.uart_tx o.led (Hw.cat pOut (Hw.cat vOut (Hw.slice 0 6 o.oled))))))
 
 -- on the board: slowed down, the pins mapped to the header's port, registered
 def OledArty.onBoard (c : Circuit OledPins.code RgbBoard.code) : Circuit OledPins.code ArtyOled.code :=

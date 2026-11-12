@@ -335,8 +335,8 @@ def blobsStep {r : HwTy → Type} [Hw r] (c : RgbCfg) (rom : RomT) (s : BlobsDem
       (StageA.unpack (stageAStep s.a (bor fStart shift) tx ty sc))
       (StageB.unpack (stageBStep s.b shift s.a.out sc))
       (Hw.mux frameGo (Hw.lit 6 0) (Hw.mux (eqLit s.fdel 63) s.fdel (inc s.fdel)))))
-    (rgbOut cs bar)
+    (rgbOut (RProg.frameAt c) cs bar)
 
 def blobsDesign (c : RgbCfg) : Circuit OledPins.code RgbBoard.code :=
-  let rom := RProg.tree;
+  let rom := RProg.tree c;
   Circuit.bundled (BlobsDemo.bundle c.frameLog) OledPins.bundle RgbBoard.bundle (BlobsDemo.init c) (blobsStep c rom)

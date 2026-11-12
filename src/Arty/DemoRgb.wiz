@@ -21,9 +21,9 @@ structure RgbBoard (r : HwTy → Type) where
 
 -- the outputs: the TX line idle, the LEDs, the OLED's pins (the record
 -- needs its type written: wiz ada3a919 cannot infer it here, FINDINGS.md)
-def rgbOut {r : HwTy → Type} [Hw r] {ω fl : Nat} (cs : RCtl fl r) (leds : r B4) : r RgbBoard.code :=
+def rgbOut {r : HwTy → Type} [Hw r] (fa : Nat) {ω fl : Nat} (cs : RCtl fl r) (leds : r B4) : r RgbBoard.code :=
   let p := cs.pins;
-  let b : RgbBoard r := RgbBoard.mk hi (Hw.cat (rctlShowing cs) leds) p.cs cs.spi.mosi cs.spi.sclk p.dc p.res p.vccen p.pmoden;
+  let b : RgbBoard r := RgbBoard.mk hi (Hw.cat (rctlShowing fa cs) leds) p.cs cs.spi.mosi cs.spi.sclk p.dc p.res p.vccen p.pmoden;
   RgbBoard.pack b
 
 -- the key on the serial port
@@ -65,8 +65,8 @@ def demoRgbStep {r : HwTy → Type} [Hw r] (c : RgbCfg) (n : Nat) (rom : RomT) (
   Hw.pair
     (DemoRgb.pack c.frameLog (DemoRgb.mk (RCtl.unpack c.frameLog (rctlStep c rom cs color))
       (Key.unpack (keyStep n s.key x.uart_rx))))
-    (rgbOut cs oneHot)
+    (rgbOut (RProg.frameAt c) cs oneHot)
 
 def demoRgb (c : RgbCfg) (n : Nat) : Circuit OledPins.code RgbBoard.code :=
-  let rom := RProg.tree;
+  let rom := RProg.tree c;
   Circuit.bundled (DemoRgb.bundle c.frameLog) OledPins.bundle RgbBoard.bundle (DemoRgb.init c) (demoRgbStep c n rom)

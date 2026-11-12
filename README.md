@@ -119,6 +119,13 @@ periods: what the circuits' own paths have), and the one-period paths from `ce` 
 checked with `scripts/sdfpath.py` on nextpnr's SDF (`arty bit` writes
 `build/DEVICE/NAME.sdf`).
 
+**On the board (2026-11-12): not working yet on USB power.** Loading an OLED design
+resets the board when the panel's supply (VCCEN) comes on: the USB side re-enumerates
+and the FPGA reloads from flash. With VCCEN held low (`oled_novcc`) the design runs
+(LEDs as designed, no reset). Soft-start variants (`oled_softvcc`, `oled_soft`,
+`oled_gentle`) are written but not yet built or tried. FINDINGS.md has the details.
+LEDs of the OLED designs: LD4 PMODEN, LD5 display on, LD6 and LD7 the design's own.
+
 **Checks** (`arty gen oled_test oled_demo oled_blobs oled_show`): each circuit is run on
 its own with short waits and frames back to back, and its pins go through the SSD1331
 model of wiz-icestick-uart (`QModel`: the serial interface, the command table with its

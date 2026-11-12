@@ -128,8 +128,8 @@ def isPrefix : List Nat → List Nat → Bool
   | .cons a as, .cons b bs => Bool.and (Nat.beq a b) (isPrefix as bs)
   | .cons _ _, .nil => .false
 
-def expectRgbCmds (k : Nat) : List Nat :=
-  List.append (RProg.cmdsOf RProg.init) (repeatList k (RProg.cmdsOf RProg.loop))
+def expectRgbCmds (c : RgbCfg) (k : Nat) : List Nat :=
+  List.append (RProg.cmdsOf (RProg.init c)) (repeatList k (RProg.cmdsOf RProg.loop))
 
 def oledFrames (name : String) (c : RgbCfg) : Nat → List QFrame → EIO Unit
   | k, .nil => EIO.pure ()
@@ -164,7 +164,7 @@ def genOled (d : Design) : EIO Unit := do
     <+> Hdl.show (List.length frames) <+> " frames");
   check "PMODEN, then RES low for at least tRes, then the commands" (Bool.and (Nat.le (R.get ts T.vdd + c.tVdd) (R.get ts T.first))
     (Nat.le (R.get ts T.resLo + c.tRes) (R.get ts T.resHi)));
-  check "the command bytes are the program's, in order" (isPrefix cmds (expectRgbCmds (List.length frames + 1)));
+  check "the command bytes are the program's, in order" (isPrefix cmds (expectRgbCmds c (List.length frames + 1)));
   check "VCCEN after RES, display on at least tVcc after VCCEN"
     (Bool.and (Nat.lt (R.get ts T.resHi) (R.get ts T.vbat)) (Nat.le (R.get ts T.vbat + c.tVcc) (R.get ts T.on)));
   check "the SSD1331's registers as wanted" (Q.wanted m.regs);
@@ -177,7 +177,7 @@ def genOled (d : Design) : EIO Unit := do
   let m2 := QModel.ofRun (Hdl.map OledArty.leaves ys2);
   let cmds2 := Hdl.reverse m2.cmds;
   check ("slowed down: " <+> Hdl.show (List.length cmds2) <+> " command bytes in 20000 cycles, the program's")
-    (Bool.and (isPrefix cmds2 (expectRgbCmds 1)) (Nat.le 30 (List.length cmds2)));
+    (Bool.and (isPrefix cmds2 (expectRgbCmds c 1)) (Nat.le 30 (List.length cmds2)));
   check "slowed down: the reset pulse 8 times as long"
     (Nat.le (8 * c.tRes) (R.get m2.times T.resHi - R.get m2.times T.resLo));
   check "slowed down: netlist simulation = value simulation" (leavesEq (Netlist.simulate (Design.netlist slow) ins2) ys2);
