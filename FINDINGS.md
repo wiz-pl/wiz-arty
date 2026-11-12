@@ -1,5 +1,7 @@
 # Findings: Wiz's HDL on the Arty A7 with openXC7
 
+The toolchain bugs found here, each with a minimal repro, are in [UPSTREAM.md](UPSTREAM.md).
+
 From porting the iCEstick designs to a Digilent Arty A7-35T (2026-11-12, Wiz branch
 `agent/artix-target`, stacked on #166).
 
@@ -96,7 +98,7 @@ with bounded buffering. The rounded-to-nominal divider is the wrong default for 
   driver skips postsim for those, and says so. `squares` is checked on the board instead
   (Vivado's unisims would do it). A
   register with a non-default initial value in front of a multiplier would be wrong in
-  hardware. That is worth an upstream report to yosys.
+  hardware. (UPSTREAM.md, 1: only seen with initial value 0, which nextpnr's default happens to restore.)
 * Utilisation and timing (35T and 100T, yosys `stat`, nextpnr): all four designs pass at
   100 MHz with Fmax 260-420 MHz; `squares` is 1 RAMB18E1 + 1 DSP48E1 + 57 FFs + ~32
   LUTs.
@@ -108,9 +110,9 @@ destination cell, so a half-rate design (2-cycle paths everywhere except from th
 enable flip-flop) cannot be checked with one constraint. What worked: constrain the clock
 at the half rate (20 ns), then bound the 1-cycle paths from the enable flip-flop with a
 longest-path search over nextpnr's `--sdf` output (`scripts/sdfpath.py FILE.sdf
-FF_CELL`: about 6.5 ns, under 10 ns). nextpnr's SDF attributes some pins of fractured LUT
-pairs (O5/O6 of one site) to the wrong LUT, which shows up as a fake two-LUT loop. That is
-worth an upstream report. A `-nobram` build of the core (512 RAM256X1S) misses 50 MHz
+FF_CELL`: about 6.5 ns, under 10 ns). nextpnr gives each LUT of a fractured pair (A6LUT/A5LUT
+of one site) all the site's pins, so its SDF has arcs from a LUT's own output back to
+itself, or between two LUTs: false loops (UPSTREAM.md, 4). A `-nobram` build of the core (512 RAM256X1S) misses 50 MHz
 (48 MHz).
 
 ## Wiz
