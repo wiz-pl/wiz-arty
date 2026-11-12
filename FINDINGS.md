@@ -17,6 +17,7 @@ reads IDCODE 0x0362D093 (xc7a35t).
 | `echo` | 23-byte string; all 256 byte values in one burst | identical |
 | `echo` (divider 868) | 4096 random bytes back to back, 3 runs | one byte dropped each time, near byte 2223 (see below) |
 | `squares` | 10 bytes; then all 256 values twice | replies exactly as specified: RAMB18E1 and DSP48E1 work |
+| `echo` (divider 866) | 4096 random bytes ×3, then 32768 in one burst | all identical |
 
 ## UART clock rates: the board must be fast of the FT2232, not exact
 
@@ -80,7 +81,12 @@ with bounded buffering. The rounded-to-nominal divider is the wrong default for 
   bitstream nextpnr gives an x-init flip-flop its primitive's default (FDRE/FDCE 0,
   FDSE/FDPE 1), which matched the design's 0 here, and the board agrees. The Xilinx cell
   models say x, so post-synthesis simulation failed (`led = xxxx`). The driver now gives
-  those flip-flops the same default before postsim and reports how many there were. A
+  those flip-flops the same default before postsim and reports how many there were.
+  That got past the DSP. The next x comes from the block RAM: **yosys's RAMB18E1/RAMB36E1
+  in `xilinx/cells_sim.v` is a black box** (parameters and timing arcs, no behaviour), so
+  no design with block RAM can be simulated after synthesis with yosys's library. The
+  driver skips postsim for those, and says so. `squares` is checked on the board instead
+  (Vivado's unisims would do it). A
   register with a non-default initial value in front of a multiplier would be wrong in
   hardware. That is worth an upstream report to yosys.
 * Utilisation and timing (35T and 100T, yosys `stat`, nextpnr): all four designs pass at

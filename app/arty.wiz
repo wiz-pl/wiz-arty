@@ -222,8 +222,14 @@ def Chars.trim : List Char → List Char
     | .true => .nil
     | .false => .cons c (Chars.trim cs)
 
-def postsimDesign (cells : String) (d : Design) : EIO Unit :=
-  replay "-g2012" "_syn" (Design.name d) (.cons (build (Design.name d <+> "_syn.v")) (.cons cells .nil))
+-- yosys's model of RAMB18E1/RAMB36E1 is a black box (parameters and timing, no
+-- behaviour): a design with block RAM reads x from it, so it is not replayed (`squares`
+-- is checked on the board instead).
+def postsimDesign (cells : String) (d : Design) : EIO Unit := do
+  syn ← FS.readFile (build (Design.name d <+> "_syn.v"));
+  match Bool.or (String.contains syn "RAMB18E1") (String.contains syn "RAMB36E1") with
+  | .true => say ("  skipped: postsim of " <+> Design.name d <+> " (block RAM: yosys has no simulation model for it)")
+  | .false => replay "-g2012" "_syn" (Design.name d) (.cons (build (Design.name d <+> "_syn.v")) (.cons cells .nil))
 
 def postsim : EIO Unit := do
   dat ← toolOutput "yosys-config" (.cons "--datdir" .nil);
