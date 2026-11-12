@@ -96,9 +96,10 @@ with bounded buffering. The rounded-to-nominal divider is the wrong default for 
   in `xilinx/cells_sim.v` is a black box** (parameters and timing arcs, no behaviour), so
   no design with block RAM can be simulated after synthesis with yosys's library. The
   driver skips postsim for those, and says so. `squares` is checked on the board instead
-  (Vivado's unisims would do it). A
-  register with a non-default initial value in front of a multiplier would be wrong in
-  hardware. (UPSTREAM.md, 1: only seen with initial value 0, which nextpnr's default happens to restore.)
+  (Vivado's unisims would do it). In the minimal repro (UPSTREAM.md, 1), yosys does not
+  absorb a register with a non-zero initial value, nor an FDSE, so the lost value was
+  always 0 on an FDRE, which nextpnr's default restores: a simulation problem, not a
+  hardware one, as far as we found.
 * Utilisation and timing (35T and 100T, yosys `stat`, nextpnr): all four designs pass at
   100 MHz with Fmax 260-420 MHz; `squares` is 1 RAMB18E1 + 1 DSP48E1 + 57 FFs + ~32
   LUTs.
